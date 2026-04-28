@@ -25,9 +25,9 @@ class BaseRewardFunction(ABC):
             task: task instance
             env: environment instance
         """
-        if self.is_potential:
+        if self.is_potential: # 当 self.is_potential 为 True 时，该方法会清除之前存储的奖励值（ self.pre_rewards.clear() ）
             self.pre_rewards.clear()
-            for agent_id in env.agents.keys():
+            for agent_id in env.agents.keys(): # 为环境中的每个智能体（ env.agents.keys() ）计算并存储初始奖励值
                 self.pre_rewards[agent_id] = self.get_reward(task, env, agent_id)
         self.reward_trajectory.clear()
 

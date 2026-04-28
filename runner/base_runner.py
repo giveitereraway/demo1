@@ -88,7 +88,7 @@ class Runner(object):
     def rollout(self):
         raise NotImplementedError
 
-    @torch.no_grad()
+    @torch.no_grad() # 使得在本函数运行的代码都不计算梯度，也不会进行反向传播
     def compute(self):
         self.policy.prep_rollout()
         next_values = self.policy.get_values(np.concatenate(self.buffer.obs[-1]),

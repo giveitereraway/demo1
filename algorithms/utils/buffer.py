@@ -4,6 +4,10 @@ from typing import Union, List
 from abc import ABC, abstractmethod
 from .utils import get_shape_from_space
 
+"""
+这个文件是强化学习经验回放缓冲区的实现,专门用于PPO算法训练过程中的数据存储和管理
+"""
+
 
 class Buffer(ABC):
 
@@ -134,7 +138,9 @@ class ReplayBuffer(Buffer):
     def compute_returns(self, next_value: np.ndarray):
         """
         Compute returns either as discounted sum of rewards, or using GAE.
-
+        计算回报值，支持两种方式：
+        - GAE(Generalized Advantage Estimation): 使用优势函数估计
+        - 标准折扣回报 : 直接计算累积折扣奖励
         Args:
             next_value(np.ndarray): value predictions for the step after the last episode step.
         """
@@ -164,12 +170,14 @@ class ReplayBuffer(Buffer):
                 self.returns[-1] = next_value
                 for step in reversed(range(self.rewards.shape[0])):
                     self.returns[step] = self.returns[step + 1] * self.gamma * self.masks[step + 1] + self.rewards[step]
+                    # self.rewards[step]其实就是即时奖励rt+1
 
     @staticmethod
     def recurrent_generator(buffer: Union[Buffer, List[Buffer]], num_mini_batch: int, data_chunk_length: int):
         """
         A recurrent generator that yields training data for chunked RNN training arranged in mini batches.
         This generator shuffles the data by sequences.
+        生成用于 RNN 训练的 mini-batch 数据
 
         Args:
             buffers (Buffer or List[Buffer])
@@ -197,23 +205,23 @@ class ReplayBuffer(Buffer):
             "data chunk length ({}).".format(n_rollout_threads, buffer_size, num_agents, data_chunk_length))
 
         # Transpose and reshape parallel data into sequential data
-        obs = np.vstack([ReplayBuffer._cast(buf.obs[:-1]) for buf in buffer])
+        obs = np.vstack([ReplayBuffer._cast(buf.obs[:-1]) for buf in buffer]) # (buffer_size,num_rollout,num_agent,obs_dim) -> (b*roll*agent,dim)
         actions = np.vstack([ReplayBuffer._cast(buf.actions) for buf in buffer])
         masks = np.vstack([ReplayBuffer._cast(buf.masks[:-1]) for buf in buffer])
         old_action_log_probs = np.vstack([ReplayBuffer._cast(buf.action_log_probs) for buf in buffer])
         advantages = np.vstack([ReplayBuffer._cast(buf.advantages) for buf in buffer])
         returns = np.vstack([ReplayBuffer._cast(buf.returns[:-1]) for buf in buffer])
         value_preds = np.vstack([ReplayBuffer._cast(buf.value_preds[:-1]) for buf in buffer])
-        rnn_states_actor = np.vstack([ReplayBuffer._cast(buf.rnn_states_actor[:-1]) for buf in buffer])
+        rnn_states_actor = np.vstack([ReplayBuffer._cast(buf.rnn_states_actor[:-1]) for buf in buffer]) # -> (b*roll*agent,l，dim)
         rnn_states_critic = np.vstack([ReplayBuffer._cast(buf.rnn_states_critic[:-1]) for buf in buffer])
 
         # Get mini-batch size and shuffle chunk data
-        data_chunks = n_rollout_threads * buffer_size // data_chunk_length
-        mini_batch_size = data_chunks // num_mini_batch
-        rand = torch.randperm(data_chunks).numpy()
-        sampler = [rand[i * mini_batch_size:(i + 1) * mini_batch_size] for i in range(num_mini_batch)]
+        data_chunks = n_rollout_threads * buffer_size // data_chunk_length # 32*3000//8 = 12000
+        mini_batch_size = data_chunks // num_mini_batch # 12000//5 = 2400
+        rand = torch.randperm(data_chunks).numpy() # 0到12000的随机整数排列
+        sampler = [rand[i * mini_batch_size:(i + 1) * mini_batch_size] for i in range(num_mini_batch)] # 5个2400大小的随机排列的索引
 
-        for indices in sampler:
+        for indices in sampler: # 0~5
             obs_batch = []
             actions_batch = []
             masks_batch = []
@@ -224,7 +232,7 @@ class ReplayBuffer(Buffer):
             rnn_states_actor_batch = []
             rnn_states_critic_batch = []
 
-            for index in indices:
+            for index in indices: # i~i+2400
 
                 ind = index * data_chunk_length
                 # size [T+1, N, Dim] => [T, N, Dim] => [N, T, Dim] => [N * T, Dim] => [L, Dim]
@@ -276,7 +284,7 @@ class SharedReplayBuffer(ReplayBuffer):
         # buffer config
         self.gamma = args.gamma
         self.buffer_size = args.buffer_size
-        self.use_proper_time_limits = args.use_proper_time_limits
+        self.use_proper_ = args.use_proper_time_limits
         self.use_gae = args.use_gae
         self.gae_lambda = args.gae_lambda
         # rnn config

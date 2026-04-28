@@ -22,6 +22,7 @@ class HeadingReward(BaseRewardFunction):
         Returns:
             (float): reward
         """
+        # scale越小，AI越“苛刻”地追求与目标一致
 
         heading_error_scale = 5.0  # degrees
         heading_r = math.exp(-((env.agents[agent_id].get_property_value(c.delta_heading) / heading_error_scale) ** 2))

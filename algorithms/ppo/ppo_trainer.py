@@ -35,16 +35,17 @@ class PPOTrainer():
         value_preds_batch = check(value_preds_batch).to(**self.tpdv)
 
         # Reshape to do in a single forward pass for all steps
+        # Critic 预测的状态价值（values）；当前策略对这些动作的对数概率（action_log_probs）；当前策略的动作分布熵（dist_entropy）
         values, action_log_probs, dist_entropy = policy.evaluate_actions(obs_batch,
                                                                          rnn_states_actor_batch,
                                                                          rnn_states_critic_batch,
                                                                          actions_batch,
                                                                          masks_batch)
 
-        # Obtain the loss function
-        ratio = torch.exp(action_log_probs - old_action_log_probs_batch)
-        surr1 = ratio * advantages_batch
-        surr2 = torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param) * advantages_batch
+        # Obtain the loss function loss=策略损失+价值损失+熵损失
+        ratio = torch.exp(action_log_probs - old_action_log_probs_batch) # 新旧策略比
+        surr1 = ratio * advantages_batch # 概率比乘以优势函数
+        surr2 = torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param) * advantages_batch # 限制
         policy_loss = torch.sum(torch.min(surr1, surr2), dim=-1, keepdim=True)
         policy_loss = -policy_loss.mean()
 
@@ -54,7 +55,7 @@ class PPOTrainer():
             value_losses_clipped = (value_pred_clipped - returns_batch).pow(2)
             value_loss = 0.5 * torch.max(value_losses, value_losses_clipped)
         else:
-            value_loss = 0.5 * (returns_batch - values).pow(2)
+            value_loss = 0.5 * (returns_batch - values).pow(2) #returns_batch是回报(累计奖励),values是Critic预测的状态价值
         value_loss = value_loss.mean()
 
         policy_entropy_loss = -dist_entropy.mean()

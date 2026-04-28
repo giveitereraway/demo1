@@ -23,12 +23,12 @@ class SingleControlEnv(BaseEnv):
             raise NotImplementedError(f'Unknown taskname: {taskname}')
 
     def reset(self):
-        self.current_step = 0
-        self.reset_simulators()
-        self.heading_turn_counts = 0
-        self.task.reset(self)
-        obs = self.get_obs()
-        return self._pack(obs)
+        self.current_step = 0 # 重置步数计数器
+        self.reset_simulators() # 重置仿真器状态：这会重新初始化飞机的位置、姿态、目标状态等
+        self.heading_turn_counts = 0 # 重置航向转弯计数
+        self.task.reset(self) # 重置任务状态
+        obs = self.get_obs() # 获取初始观测
+        return self._pack(obs) # 打包并返回观测
 
     def reset_simulators(self):
         if self.init_states is None:

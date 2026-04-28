@@ -12,16 +12,34 @@ from envs.JSBSim.core.catalog import Catalog as c
 from envs.JSBSim.utils.utils import in_range_rad, get_root_dir
 from envs.JSBSim.envs import SingleCombatEnv, SingleControlEnv
 from envs.JSBSim.model.baseline_actor import BaselineActor
+from algorithms.ppo.ppo_actor import PPOActor
 
-
-class BaselineAgent(ABC):
-    def __init__(self, agent_id) -> None:
-        self.model_path = get_root_dir() + '/model/baseline_model.pt'
-        self.actor = BaselineActor() 
-        self.actor.load_state_dict(torch.load(self.model_path)) # 将预训练的参数权重加载到新的模型之中
+class PPO_BaselineAgent(ABC):
+    def __init__(self, agent_id, env, args, device=torch.device("cpu")) -> None:
+        self.model_path = get_root_dir() + '/model/actor_follow.pt'
+        self.actor = PPOActor(args, env.observation_space, env.action_space, device)
+        self.actor.load_state_dict(torch.load(self.model_path, weights_only=True)) # 将预训练的参数权重加载到新的模型之中
         self.actor.eval() # 设置为验证模式，不使用Dropout和BatchNorm，相当于.train(False)
         self.agent_id = agent_id
         self.state_var = [
+            c.position_long_gc_deg,             # 0. lontitude  (unit: °)经度
+            c.position_lat_geod_deg,            # 1. latitude   (unit: °)纬度
+            c.position_h_sl_m,                  # 2. altitude   (unit: m)海拔
+            c.attitude_roll_rad,                # 3. roll       (unit: rad)横滚角
+            c.attitude_pitch_rad,               # 4. pitch      (unit: rad)俯仰角
+            c.attitude_heading_true_rad,        # 5. yaw        (unit: rad)航向角
+            c.velocities_v_north_mps,           # 6. v_north    (unit: m/s)向北速度分量
+            c.velocities_v_east_mps,            # 7. v_east     (unit: m/s)向东速度分量
+            c.velocities_v_down_mps,            # 8. v_down     (unit: m/s)向下速度分量
+            c.velocities_u_mps,                 # 9. v_body_x   (unit: m/s)机体坐标系X轴速度
+            c.velocities_v_mps,                 # 10. v_body_y  (unit: m/s)机体坐标系Y轴速度
+            c.velocities_w_mps,                 # 11. v_body_z  (unit: m/s)机体坐标系Z轴速度
+            c.velocities_vc_mps,                # 12. vc        (unit: m/s)空速
+            c.accelerations_n_pilot_x_norm,     # 13. a_north   (unit: G)X轴加速度（前向）
+            c.accelerations_n_pilot_y_norm,     # 14. a_east    (unit: G)Y轴加速度（侧向）
+            c.accelerations_n_pilot_z_norm,     # 15. a_down    (unit: G)Z轴加速度（垂直）
+        ]
+        """self.state_var = [
             c.delta_altitude,                   #  0. delta_h   (unit: m)
             c.delta_heading,                    #  1. delta_heading  (unit: °)
             c.delta_velocities_u,               #  2. delta_v   (unit: m/s)
@@ -32,7 +50,7 @@ class BaselineAgent(ABC):
             c.velocities_w_mps,                 #  7. v_body_z   (unit: m/s)
             c.velocities_vc_mps,                #  8. vc        (unit: m/s)
             c.position_h_sl_m                   #  9. altitude  (unit: m)
-        ]
+        ]"""
         self.reset()
 
     def reset(self):
@@ -43,7 +61,7 @@ class BaselineAgent(ABC):
         raise NotImplementedError
 
     def get_observation(self, env, task, delta_value):
-        uid = list(env.agents.keys())[self.agent_id]
+        """uid = list(env.agents.keys())[self.agent_id]
         obs = env.agents[uid].get_property_values(self.state_var)
         norm_obs = np.zeros(12)
         norm_obs[0] = delta_value[0] / 1000          #  0. ego delta altitude  (unit: 1km)
@@ -59,21 +77,27 @@ class BaselineAgent(ABC):
         norm_obs[10] = obs[7] / 340                  #  10. ego_v_z    (unit: mh)
         norm_obs[11] = obs[8] / 340                  #  11. ego_vc        (unit: mh)
         norm_obs = np.expand_dims(norm_obs, axis=0)  # dim: (1,12)
+        return norm_obs"""
+         # 直接用任务类的get_obs，确保和环境完全一致
+        uid = list(env.agents.keys())[self.agent_id]
+        obs = task.get_obs(env, uid)
+        norm_obs = np.expand_dims(obs, axis=0)  
         return norm_obs
 
     def get_action(self, env, task):
         delta_value = self.set_delta_value(env, task)
         observation = self.get_observation(env, task, delta_value)
-        _action, self.rnn_states = self.actor(observation, self.rnn_states) # 调用了forward函数
+        obs = torch.tensor(observation, dtype=torch.float32)
+        masks = torch.ones((1, 1))
+        _action, _, self.rnn_states = self.actor(obs, self.rnn_states, masks, deterministic=True) # 调用了forward函数
         action = _action.detach().cpu().numpy().squeeze()
         return action
+    
+class PPO_FollowAgent(PPO_BaselineAgent): # 追击智能体
+    def __init__(self, agent_id, env, args, device) -> None:
+        super().__init__(agent_id, env, args, device)
 
-
-class PursueAgent(BaselineAgent): # 追击智能体
-    def __init__(self, agent_id) -> None:
-        super().__init__(agent_id)
-
-    def set_delta_value(self, env, task):
+    def set_delta_value(self, env, task): # 计算己方与敌方飞行器之间的状态差值
         # NOTE: only adapt for 1v1
         ego_uid, enm_uid = list(env.agents.keys())[self.agent_id], list(env.agents.keys())[(self.agent_id+1)%2] 
         ego_x, ego_y, ego_z = env.agents[ego_uid].get_position()
@@ -93,83 +117,3 @@ class PursueAgent(BaselineAgent): # 追击智能体
         delta_velocity = env.agents[enm_uid].get_property_value(c.velocities_u_mps) - \
                          env.agents[ego_uid].get_property_value(c.velocities_u_mps)
         return np.array([delta_altitude, delta_heading, delta_velocity])
-
-
-class ManeuverAgent(BaselineAgent): # 机动智能体
-    def __init__(self, agent_id, maneuver: Literal['l', 'r', 'n']) -> None:
-        super().__init__(agent_id)
-        self.turn_interval = 30
-        self.dodge_missile = False # if set true, start turn when missile is detected
-        if maneuver == 'l':
-            self.target_heading_list = [0]
-        elif maneuver == 'r':
-            self.target_heading_list = [np.pi/2, np.pi/2, np.pi/2, np.pi/2]
-        elif maneuver == 'n':
-            self.target_heading_list = [np.pi, np.pi, np.pi, np.pi]
-        elif maneuver == 'triangle':
-            self.target_heading_list = [np.pi/3, np.pi, -np.pi/3]*2
-        self.target_altitude_list = [6000] * 6
-        self.target_velocity_list = [243]  * 6
-
-    def reset(self):
-        self.step = 0
-        self.rnn_states = np.zeros((1, 1, 128))
-        self.init_heading = None
-
-    def set_delta_value(self, env, task):
-        step_list = np.arange(1, len(self.target_heading_list)+1) * self.turn_interval / env.time_interval
-        uid = list(env.agents.keys())[self.agent_id]
-        cur_heading = env.agents[uid].get_property_value(c.attitude_heading_true_rad)
-        if self.init_heading is None:
-            self.init_heading = cur_heading
-        if not self.dodge_missile or task._check_missile_warning(env, self.agent_id) is not None:
-            for i, interval in enumerate(step_list):
-                if self.step <= interval:
-                    break
-            delta_heading = self.init_heading + self.target_heading_list[i] - cur_heading
-            delta_altitude = self.target_altitude_list[i] - env.agents[uid].get_property_value(c.position_h_sl_m)
-            delta_velocity = self.target_velocity_list[i] - env.agents[uid].get_property_value(c.velocities_u_mps)
-            self.step += 1
-        else:
-            delta_heading = self.init_heading  - cur_heading
-            delta_altitude = 6000 - env.agents[uid].get_property_value(c.position_h_sl_m)
-            delta_velocity = 243 - env.agents[uid].get_property_value(c.velocities_u_mps)
-
-        return np.array([delta_altitude, delta_heading, delta_velocity])
-
-
-def test_maneuver():
-    env = SingleCombatEnv(config_name='1v1/NoWeapon/test/opposite')
-    obs = env.reset()
-    env.render(filepath="control.txt.acmi")
-    agent0 = ManeuverAgent(agent_id=0, maneuver='triangle')
-    agent1 = PursueAgent(agent_id=1)
-    reward_list = []
-    while True:
-        action0 = agent0.get_action(env, env.task)
-        action1 = agent1.get_action(env, env.task)
-        actions = [action0, action1]
-        obs, reward, done, info = env.step(actions) # 用 env.step(actions) 推进环境一步，获得新的观测、奖励、done信号等
-        env.render(filepath="control.txt.acmi")
-        reward_list.append(reward[0])
-        if np.array(done).all():
-            print(info)
-            break
-    plt.plot(reward_list)
-    plt.savefig('rewards.png')
-
-
-if __name__ == '__main__':
-    test_maneuver()
-
-"""
-整体流程：
-1、加载模型：初始化时加载训练好的 PyTorch 模型权重。
-2、初始化环境和智能体：创建仿真环境和两个智能体（一个机动、一个追击）。
-3、循环仿真：
-    智能体用模型推理动作。
-    环境推进一步，获得新状态和奖励。
-    染当前状态到 .acmi 文件。
-    检查是否结束，结束则退出循环。
-4、输出：最终生成的 .acmi 文件可用于可视化分析。
-"""

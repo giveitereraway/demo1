@@ -34,21 +34,23 @@ class JSBSimRunner(Runner):
             self.restore()
 
     def run(self):
-        self.warmup()
+        self.warmup() # warmup() 为后续的 collect() 和 insert() 方法提供基础：collect() 方法会使用 self.buffer.obs[step] 来获取当前观测；insert() 方法会向缓冲区添加新的经验数据
 
         start = time.time()
         self.total_num_steps = 0
-        episodes = self.num_env_steps // self.buffer_size // self.n_rollout_threads
+        episodes = self.num_env_steps // self.buffer_size // self.n_rollout_threads # 1041步
 
         for episode in range(episodes):
 
             heading_turns_list = []
 
+            """PPO算法需要“采集一段轨迹”后,统一进行训练,而不是每一步都立刻更新网络
+            只有收集到足够多的经验数据后,才能用这些数据来计算Return、Advantag,并进行批量训练"""
             for step in range(self.buffer_size):
-                # Sample actions
+                # Sample actions 采样动作，获取状态价值
                 values, actions, action_log_probs, rnn_states_actor, rnn_states_critic = self.collect(step)
 
-                # Obser reward and next obs
+                # Obser reward and next obs 获取新观测和奖励
                 obs, rewards, dones, infos = self.envs.step(actions)
 
                 # Extra recorded information
@@ -58,12 +60,12 @@ class JSBSimRunner(Runner):
 
                 data = obs, actions, rewards, dones, action_log_probs, values, rnn_states_actor, rnn_states_critic
 
-                # insert data into buffer
+                # insert data into buffer 存储经验数据
                 self.insert(data)
 
             # compute return and update network
-            self.compute()
-            train_infos = self.train()
+            self.compute() # 计算回报函数
+            train_infos = self.train() # 更新策略和价值网络
 
             # post process
             self.total_num_steps = (episode + 1) * self.buffer_size * self.n_rollout_threads
@@ -105,18 +107,20 @@ class JSBSimRunner(Runner):
 
     @torch.no_grad()
     def collect(self, step):
-        self.policy.prep_rollout()
+        self.policy.prep_rollout() # 策略网络设置为评估模式
+        # 使用 np.concatenate() 将多个线程的观测数据合并为单一数组
         values, actions, action_log_probs, rnn_states_actor, rnn_states_critic \
-            = self.policy.get_actions(np.concatenate(self.buffer.obs[step]),
-                                      np.concatenate(self.buffer.rnn_states_actor[step]),
-                                      np.concatenate(self.buffer.rnn_states_critic[step]),
-                                      np.concatenate(self.buffer.masks[step]))
+            = self.policy.get_actions(np.concatenate(self.buffer.obs[step]), # (32, 1, 12) → (32, 12)
+                                      np.concatenate(self.buffer.rnn_states_actor[step]), # (32, 1, 1, 128) → (32, 1, 128)
+                                      np.concatenate(self.buffer.rnn_states_critic[step]), # (32, 1, 1, 128) → (32, 1, 128)
+                                      np.concatenate(self.buffer.masks[step])) # (32, 1, 1) → (32, 1)
         # split parallel data [N*M, shape] => [N, M, shape]
-        values = np.array(np.split(_t2n(values), self.n_rollout_threads))
-        actions = np.array(np.split(_t2n(actions), self.n_rollout_threads))
-        action_log_probs = np.array(np.split(_t2n(action_log_probs), self.n_rollout_threads))
-        rnn_states_actor = np.array(np.split(_t2n(rnn_states_actor), self.n_rollout_threads))
-        rnn_states_critic = np.array(np.split(_t2n(rnn_states_critic), self.n_rollout_threads))
+        # 将一维数组按n_rollout_threads分割成多个子数组，将分割后的数组列表转换为二维NumPy数组
+        values = np.array(np.split(_t2n(values), self.n_rollout_threads)) # (32, 1) → (32, 1, 1) 32 个环境 × 1 个智能体 × 1 维价值
+        actions = np.array(np.split(_t2n(actions), self.n_rollout_threads)) # (32, 5) → (32, 1, 5) 32 个环境 × 1 个智能体 × 5 维动作
+        action_log_probs = np.array(np.split(_t2n(action_log_probs), self.n_rollout_threads)) # (32, 1) → (32, 1, 1) 32 个环境 × 1 个智能体 × 1 维对数概率
+        rnn_states_actor = np.array(np.split(_t2n(rnn_states_actor), self.n_rollout_threads)) # (32, 1, 128) → (32, 1, 1, 128) 32 个环境 × 1 个智能体 × 1 层 GRU × 128 维隐状态
+        rnn_states_critic = np.array(np.split(_t2n(rnn_states_critic), self.n_rollout_threads)) # (32, 1, 128) → (32, 1, 1, 128) 32 个环境 × 1 个智能体 × 1 层 GRU × 128 维隐状态
         return values, actions, action_log_probs, rnn_states_actor, rnn_states_critic
 
     def insert(self, data: List[np.ndarray]):

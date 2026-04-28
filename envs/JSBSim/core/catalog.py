@@ -8,9 +8,19 @@ from ..utils.utils import in_range_deg
 
 """
 A class to wrap and extend the Property object implemented in JSBSim
+这份代码是 JSBSim飞行仿真属性目录系统 ,它定义了飞行仿真中所有可用的物理属性和控制参数,是连接JSBSim C++仿真引擎与Python强化学习环境的核心桥梁
+Property的8个字段说明:
+1. name_jsbsim :JSBSim内部属性名称(如"position/h-sl-ft")
+2. description ：属性的文字描述(如"海拔高度[英尺]")
+3. min ：属性值的最小值
+4. max ：属性值的最大值
+5. access ：访问权限（"R"只读、"W"只写、"RW"读写）
+6. spaces :对应的Gymnasium空间类型(Box连续空间或Discrete离散空间)
+7. clipped ：是否对属性值进行范围裁剪
+8. update ：动态更新函数，用于计算属性值（如果属性不是直接从 JSBSim 获取）
 """
 Property = namedtuple("Property", "name_jsbsim description min max access spaces clipped update")
-Property.__new__.__defaults__ = (None, None, float("-inf"), float("+inf"), "RW", Box, True, None)
+Property.__new__.__defaults__ = (None, None, float("-inf"), float("+inf"), "RW", Box, True, None) # 设置默认值
 
 
 class JsbsimCatalog(Property, Enum):
@@ -128,13 +138,13 @@ class JsbsimCatalog(Property, Enum):
     @staticmethod
     def update_equal_engine_props(sim, prop):
         """
-        Update the given property for all engines
-        :param sim: simulation to use
-        :param prop: property to update
+        Update the given property for all engines   同步更新多引擎飞机的所有引擎属性值
+        :param sim: simulation to use      sim : 飞行模拟器实例(AircraftSimulator类型)
+        :param prop: property to update    prop : 要同步更新的属性对象(Property类型)
         """
-        value = sim.get_property_value(prop)
-        n = sim.jsbsim_exec.get_propulsion().get_num_engines()
-        for i in range(1, n):
+        value = sim.get_property_value(prop) # 获取当前属性值
+        n = sim.jsbsim_exec.get_propulsion().get_num_engines() # 获取引擎数量
+        for i in range(1, n): # 为每个基准引擎外的引擎设置相同的属性值（索引0是基准引擎）
             sim.jsbsim_exec.set_property_value(prop.name_jsbsim + "[" + str(i) + "]", value)
 
     def update_equal_throttle_pos(sim):
@@ -194,6 +204,14 @@ class JsbsimCatalog(Property, Enum):
     fcs_rudder_cmd_norm = Property("fcs/rudder-cmd-norm", "rudder commanded position, normalised", -1.0, 1.0)
     fcs_throttle_cmd_norm = Property(
         "fcs/throttle-cmd-norm", "throttle commanded position, normalised", 0.0, 0.9, update=update_equal_throttle_cmd
+    )
+    missile_launch_cmd = Property(
+        "fcs/missile-launch-cmd",  # JSBSim属性名（你可以根据实际模型调整）
+        "missile launch command",  # 描述
+        0,                         # 最小值
+        1,                         # 最大值
+        spaces=Discrete,
+        access="RW"                # 读写权限
     )
     fcs_mixture_cmd_norm = Property(
         "fcs/mixture-cmd-norm", "engine mixture setting, normalised", 0.0, 1.0, update=update_equal_mixture_cmd
@@ -523,6 +541,8 @@ class ExtraCatalog(Property, Enum):
         "tc/target-longitude-geod-deg", "target geocentric longitude [deg]", -180, 180
     )
     heading_check_time = Property("heading_check_time", "time to check whether current time reaches heading time", 0, 1000000)
+
+    
 
 
 class MixedCatalog(dict):

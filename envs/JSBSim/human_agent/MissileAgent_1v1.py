@@ -6,20 +6,32 @@ from ..envs.singlecontrol_env import SingleControlEnv
 from .agent_base import BaseAgent
 import curses
 import threading
+import gym
 
-class HumanAgent(BaseAgent):
-    def __init__(self, env: SingleControlEnv):
+class MissileAgent_1v1(BaseAgent):
+    def __init__(self, env: SingleControlEnv, agent_id: int):
         super().__init__(env)  # 直接传入 env，并从 env 获取 task
         self.env = env
+        self.agent_id = agent_id
         self.action_space = self.task.action_space  # 获取动作空间
-        self.action_dim = len(self.action_space.nvec)  # 动作维度（4个控制命令）
-        self.aileron = 20   # 控制横滚角 (Aileron) [0, 40] -> [-1., 1.] 
-        self.elevator = 20  # 控制俯仰角 (Elevator) [0, 40] -> [-1., 1.] 
+
+        """# 适配Tuple动作空间
+        self.ctrl_space = self.action_space[0]
+        self.missile_space = self.action_space[1]
+        self.action_dim = self.ctrl_space.nvec.shape[0] + 1
+        self.nvec = np.concatenate([self.ctrl_space.nvec, [self.missile_space.n]])"""
+
+        #self.action_dim = len(self.action_space.nvec)  # 动作维度（4个控制命令）
+        self.aileron = 20   # 控制横滚角 (Aileron) [0, 40] -> [-1., 1.]
+        self.elevator = 20  # 控制俯仰角 (Elevator) [0, 40] -> [-1., 1.]
         self.rudder = 20    # 控制偏航角 (Rudder) [0, 40] -> [-1., 1.] 
         self.throttle = 15  # 控制油门 (Throttle)  [0, 30] -> [0.4, 0.9] 
+        self.missile_launch = 0  # 0表示不发射，1表示发射
 
         self.input_thread = None
-        self.stop_event = threading.Event()
+        self.stop_event = threading.Event()       
+
+
                 
         # 注册清理操作
         atexit.register(self.cleanup)
@@ -76,12 +88,13 @@ class HumanAgent(BaseAgent):
 
                 # 更新控制面板显示
                 control_win.addstr(f"Aileron: {self.aileron}  Elevator: {self.elevator}  Rudder: {self.rudder}  Throttle: {self.throttle}\n")
-                control_win.addstr("Use WSAD to control Aileron/Elevator, Z/X for Rudder, O for Throttle Up, P for Throttle Down.\n")
+                control_win.addstr(f"Missile: {self.missile_launch}\n")
+                control_win.addstr("Use Arrow keys to control Aileron/Elevator, Z/X for Rudder, PgUp for Throttle Up, PgDn for Throttle Down.\n")
 
                 info_win.clear()
 
                 # 设置一个适当的超时时间，单位是毫秒，例如 500 毫秒
-                stdscr.timeout(500)         # 设置 stdscr 的超时时间为 500 毫秒。如果在 500 毫秒内没有键盘输入，则返回key为 -1，从而避免程序阻塞。
+                stdscr.timeout(10)         # 设置 stdscr 的超时时间为 500 毫秒。如果在 500 毫秒内没有键盘输入，则返回key为 -1，从而避免程序阻塞。
 
 
                 key = stdscr.getch()        # 读取用户按下的键。
@@ -89,7 +102,7 @@ class HumanAgent(BaseAgent):
                 self.update_action(key)     # 更新动作
                 
                 # 限制处理速度，避免过快刷新
-                time.sleep(0.05)
+                time.sleep(0)
 
                 # 刷新窗口
                 self.refresh_windows(control_win, info_win)
@@ -100,14 +113,14 @@ class HumanAgent(BaseAgent):
     def update_action(self, key):
         # 左右控制横滚角
         if key == ord('a') and self.aileron < 40:
-            self.aileron -= 1
+            self.aileron -= 5
         elif key == ord('d') and self.aileron > 0:
-            self.aileron += 1
+            self.aileron += 5
         # 上下控制俯仰角
         elif key == ord('w') and self.elevator > 0:
-            self.elevator += 1
+            self.elevator += 10
         elif key == ord('s') and self.elevator < 40:
-            self.elevator -= 1
+            self.elevator -= 10
         # 控制其他操作
         elif key == ord('z') and self.rudder > 0:
             self.rudder -= 1
@@ -117,18 +130,22 @@ class HumanAgent(BaseAgent):
             self.throttle += 1
         elif key == ord('p') and self.throttle > 0:
             self.throttle -= 1
+        elif key == ord(' '):  # 空格键
+            self.missile_launch = 1
         elif key == -1:
             self.elevator = 20
             self.aileron = 20
             self.rudder = 20
             self.throttle = 15
+            self.missile_launch = 0
     
     def get_action(self):
         # 返回动作数组
         # 在创建动作数组之前，打印变量的值
-        action = np.array([self.aileron, self.elevator, self.rudder, self.throttle])
-        return action.reshape(1, -1)  # 转换为二维数组
+        action = np.array([self.aileron, self.elevator, self.rudder, self.throttle, self.missile_launch])
+        return action.flatten()  # 转换为一维数组
     
+
     def step(self):
         """
         Perform an action step in the environment based on the user input.
@@ -150,12 +167,3 @@ class HumanAgent(BaseAgent):
         """析构函数，确保线程停止"""
         # print("Cleaning up HumanAgent...")
         self.stop_input_thread()  # 显式调用 stop_input_thread
-
-
-"""
- A/D：控制副翼（横滚角，Aileron）
- w/s：控制升降舵（俯仰角，Elevator）
- Z/X 键：控制方向舵（偏航角，Rudder）
- O/P：控制油门（Throttle）
-无输入时：自动回中（各控制量回到中值）
-"""

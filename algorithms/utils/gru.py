@@ -1,7 +1,8 @@
 
 import torch
 import torch.nn as nn
-
+# 当 mask=0 时，表示当前状态是一个episode的结束，隐藏状态会被重置；当 mask=1 时，隐藏状态会从之前的时间步传递过来
+# 这确保了智能体不会在不同episode之间混淆信息
 
 class GRULayer(nn.Module):
     def __init__(self, input_size: int, hidden_size: int, num_layers: int):
@@ -33,8 +34,8 @@ class GRULayer(nn.Module):
             # We need to tackle the problem more efficiently
 
             # x is a (T, N, input_size) tensor that has been flatten to (T * N, -1)
-            N = hxs.size(0)
-            T = int(x.size(0) / N)
+            N = hxs.size(0) # 2400
+            T = int(x.size(0) / N) # 19200 / 2400 = 8
             # unflatten x and masks
             x = x.view(T, N, x.size(1))  # [T * N, input_size] => [T, N, input_size]
             masks = masks.view(T, N)     # [T * N, 1] => [T, N]
@@ -42,10 +43,11 @@ class GRULayer(nn.Module):
             # Let's figure out which steps in the sequence have a zero for any agent
             # We will always assume t=0 has a zero in it as that makes the logic cleaner
             has_zeros = ((masks[1:] == 0.0)
-                         .any(dim=-1)       # [T, N] => [T, 1]
-                         .nonzero(as_tuple=False)
+                         .any(dim=-1)#判断是否有true # [T, N] => [T, 1]
+                         .nonzero(as_tuple=False) # 找出True值的索引
                          .squeeze(dim=-1)   # [T, 1] => [T]
                          .cpu())
+            # 例如：has_zeros = [10,20] 表示第10步和第20步有智能体完成了一个episode
             # +1 to correct the masks[1:]
             has_zeros = (has_zeros + 1).numpy().tolist()
             # add t=0 and t=T to the list

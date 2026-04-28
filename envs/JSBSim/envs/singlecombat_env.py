@@ -2,7 +2,7 @@ import numpy as np
 from .env_base import BaseEnv
 from ..tasks import SingleCombatTask, SingleCombatDodgeMissileTask, HierarchicalSingleCombatDodgeMissileTask, \
     HierarchicalSingleCombatShootTask, SingleCombatShootMissileTask, HierarchicalSingleCombatTask
-from ..human_task.HumanSingleCombatTask import  HumanSingleCombatTask
+from ..human_task.HumanSingleCombatTask import HumanSingleCombatTask, HumanSingleCombat_shoot_Task
 
 
 class SingleCombatEnv(BaseEnv):
@@ -14,6 +14,7 @@ class SingleCombatEnv(BaseEnv):
         # Env-Specific initialization here!
         assert len(self.agents.keys()) == 2, f"{self.__class__.__name__} only supports 1v1 scenarios!"
         self.init_states = None
+        # 会执行BaseEnv的__init__方法，包括load_task(),load_simulator(),seed()
 
     def load_task(self):
         taskname = getattr(self.config, 'task', None)
@@ -31,6 +32,8 @@ class SingleCombatEnv(BaseEnv):
             self.task = HierarchicalSingleCombatShootTask(self.config)
         elif taskname == 'HumanSingleCombat':
             self.task = HumanSingleCombatTask(self.config)
+        elif taskname == 'HumanSingleCombat_shoot':
+            self.task = HumanSingleCombat_shoot_Task(self.config)
         else:
             raise NotImplementedError(f"Unknown taskname: {taskname}")
 
@@ -42,7 +45,7 @@ class SingleCombatEnv(BaseEnv):
         return self._pack(obs)
 
     def reset_simulators(self):
-        # switch side
+        # switch side 换边训练
         if self.init_states is None:
             self.init_states = [sim.init_state.copy() for sim in self.agents.values()]
         # self.init_states[0].update({

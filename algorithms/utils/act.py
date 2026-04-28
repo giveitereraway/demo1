@@ -32,24 +32,24 @@ class ACTLayer(nn.Module):
             self.action_out = Bernoulli(input_dim, action_dim, gain)
         elif isinstance(act_space, gym.spaces.MultiDiscrete):
             self._multidiscrete_action = True
-            action_dims = act_space.nvec
+            action_dims = act_space.nvec # [41 41 41 30]
             action_outs = []
             for action_dim in action_dims:
-                action_outs.append(Categorical(input_dim, action_dim, gain))
-            self.action_outs = nn.ModuleList(action_outs)
+                action_outs.append(Categorical(input_dim, action_dim, gain)) # 初始化权重，Categorical是一个线性层实例
+            self.action_outs = nn.ModuleList(action_outs) # 4个线性层
         elif isinstance(act_space, gym.spaces.Tuple) and  \
               isinstance(act_space[0], gym.spaces.MultiDiscrete) and \
                   isinstance(act_space[1], gym.spaces.Discrete):
             # NOTE: only for shoot missile
             self._shoot_action = True
-            discrete_dims = act_space[0].nvec
-            self._discrete_dim = act_space[0].shape[0]
+            discrete_dims = act_space[0].nvec # [3,5,3]
+            self._discrete_dim = act_space[0].shape[0] # 3
             self._control_shoot_dim = 2
             self._shoot_dim = 1
             action_outs = []
             for discrete_dim in discrete_dims:
                 action_outs.append(Categorical(input_dim, discrete_dim, gain))
-            action_outs.append(BetaShootBernoulli(input_dim, self._control_shoot_dim, gain))
+            action_outs.append(BetaShootBernoulli(input_dim, self._control_shoot_dim, gain)) # 负责控制导弹发射
             self.action_outs = nn.ModuleList(action_outs)
         else: 
             raise NotImplementedError(f"Unsupported action space type: {type(act_space)}!")
@@ -74,12 +74,12 @@ class ACTLayer(nn.Module):
             action_log_probs = []
             for action_out in self.action_outs:
                 action_dist = action_out(x)
-                action = action_dist.mode() if deterministic else action_dist.sample()
-                action_log_prob = action_dist.log_probs(action)
+                action = action_dist.mode() if deterministic else action_dist.sample() # action: [batch_size,1]
+                action_log_prob = action_dist.log_probs(action) # action_log_prob: [batch_size,1]
                 actions.append(action)
                 action_log_probs.append(action_log_prob)
-            actions = torch.cat(actions, dim=-1)
-            action_log_probs = torch.cat(action_log_probs, dim=-1).sum(dim=-1, keepdim=True)
+            actions = torch.cat(actions, dim=-1) # actions: [batch_size,4]
+            action_log_probs = torch.cat(action_log_probs, dim=-1).sum(dim=-1, keepdim=True) # action_log_probs: [batch_size,1]
         
         elif self._shoot_action:
             actions = []

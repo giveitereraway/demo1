@@ -126,3 +126,24 @@ class DiscreteFlattener():
 
     def write(self, observation, array, offset):
         array[..., offset:offset + 1] = self(observation)
+
+"""
+# 示例1：Dict空间
+obs_space = gym.spaces.Dict({
+    'position': gym.spaces.Box(shape=(3,)),    # 维度：3
+    'velocity': gym.spaces.Box(shape=(3,)),    # 维度：3  
+    'discrete': gym.spaces.Discrete(5)         # 维度：1
+})
+flattener = build_flattener(obs_space)
+input_dim = flattener.size  # 结果：3 + 3 + 1 = 7
+
+# 示例2：Box空间
+obs_space = gym.spaces.Box(shape=(10,))
+flattener = build_flattener(obs_space) 
+input_dim = flattener.size  # 结果：10
+
+# 示例3：Discrete空间
+obs_space = gym.spaces.Discrete(5)
+flattener = build_flattener(obs_space)
+input_dim = flattener.size  # 结果：1
+"""

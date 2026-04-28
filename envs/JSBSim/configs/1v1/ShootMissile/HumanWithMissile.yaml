@@ -1,16 +1,16 @@
 # task config
-task: HumanSingleCombat
+task: HumanSingleCombat_shoot
 
 # simulation config
-sim_freq: 60
-agent_interaction_steps: 12 # step 0.2s 每次智能体 step，环境推进的物理时间 = agent_interaction_steps / sim_freq
+sim_freq: 100
+agent_interaction_steps: 1 # step 0.2s
 
 # termination config
-max_steps: 10000      # episode length: 200s 单局最大物理时间 = max_steps × (agent_interaction_steps / sim_freq)
+max_steps: 20000             # episode length: 200s
 altitude_limit: 2500
-acceleration_limit_x: 20.0 # 10.0
-acceleration_limit_y: 20.0
-acceleration_limit_z: 20.0
+acceleration_limit_x: 10.0
+acceleration_limit_y: 10.0
+acceleration_limit_z: 10.0
 
 # aircraft config
 aircraft_configs: {
@@ -21,31 +21,37 @@ aircraft_configs: {
       ic_long_gc_deg: 103.94,
       ic_lat_geod_deg: 30.69,
       ic_h_sl_ft: 20000,
-      ic_psi_true_deg: 0.0,
+      ic_psi_true_deg: 0,
       ic_u_fps: 800.0,
     },
+    missile: 5
   },
   B0100: {
     color: Blue,
     model: f16,
     init_state: {
-      ic_lat_geod_deg: 30.59,
-      ic_long_gc_deg: 103.94,
       ic_h_sl_ft: 20000,
-      ic_psi_true_deg: 0.0, #180
+      ic_lat_geod_deg: 30.79, #60.2
+      ic_long_gc_deg: 103.94,
+      ic_psi_true_deg: 180,
       ic_u_fps: 800.0,
     },
+    missile: 2,
   }
 }
+max_attack_angle: 45        # unit: degree
+max_attack_distance: 14000  # unit: m
+min_attack_interval: 25     # unit: step
 # (lontitude, latitude, altitude)
 battle_field_center: [103.94, 30.69, 10000.0]
 
 # reward config
-PostureReward_scale: 100.0
+MissilePostureReward_scale: 30
+
+PostureReward_scale: 15.0
 PostureReward_potential: true
 PostureReward_orientation_version: v2
 PostureReward_range_version: v3
-PostureReward_target_dist: 0.5
 
 AltitudeReward_safe_altitude: 4.0
 AltitudeReward_danger_altitude: 3.5

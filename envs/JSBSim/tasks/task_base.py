@@ -119,4 +119,5 @@ class BaseTask(ABC):
     def normalize_action(self, env, agent_id, action):
         """Normalize action to be consistent with action space.
         """
+        #print("归一化完成")
         return np.array(action)

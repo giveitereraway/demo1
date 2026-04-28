@@ -63,7 +63,8 @@ class Categorical(nn.Module):
         super(Categorical, self).__init__()
 
         def init_(m):
-            return init(m, nn.init.orthogonal_, lambda x: nn.init.constant_(x, 0), gain)
+        # m: 要初始化的模块；nn.init.orthogonal_: 权重初始化，使用正交初始化方法；lambda x: nn.init.constant_(x, 0)： 偏置初始化，将偏置值初始化为0
+            return init(m, nn.init.orthogonal_, lambda x: nn.init.constant_(x, 0), gain) # 初始化权重
 
         self.logits_net = init_(nn.Linear(num_inputs, num_outputs))
 
@@ -104,7 +105,7 @@ class BetaShootBernoulli(nn.Module):
 
         self.net = init_(nn.Linear(num_inputs, num_outputs))
         self._num_outputs = num_outputs
-        self.constraint = nn.Softplus()
+        self.constraint = nn.Softplus() # 激活函数，relu的平滑版，Softplus(x)=log(1+exp(x))
 
     def forward(self, x, **kwargs):
         x = self.net(x)
@@ -114,7 +115,7 @@ class BetaShootBernoulli(nn.Module):
         beta = 1 + x[:, 1].unsqueeze(-1)
         alpha_0 = kwargs['alpha0']
         beta_0 = kwargs['beta0']
-        # print(f"{alpha}, {beta}, {alpha_0}, {beta_0}")
+        print(f"{alpha}, {beta}, {alpha_0}, {beta_0}")
         p = (alpha + alpha_0) / (alpha + alpha_0 + beta + beta_0)
         return FixedBernoulli(p)
 

@@ -93,7 +93,7 @@ def main(args):
         "envs": envs,
         "num_agents": num_agents,
         "device": device,
-        "run_dir": run_dir
+        "run_dir": run_dir,
     }
 
     # run experiments

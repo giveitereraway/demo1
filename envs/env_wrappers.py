@@ -223,6 +223,9 @@ def worker(remote: Connection, parent_remote: Connection, env_fn_wrappers):
                 raise NotImplementedError
     except KeyboardInterrupt:
         print('SubprocVecEnv worker: got KeyboardInterrupt')
+    except (EOFError, BrokenPipeError):
+        # Parent process closed, exit gracefully
+        pass
     finally:
         for env in envs:
             env.close()
@@ -412,6 +415,9 @@ def shareworker(remote: Connection, parent_remote: Connection, env_fn_wrappers):
                 raise NotImplementedError
     except KeyboardInterrupt:
         print('SubprocVecEnv worker: got KeyboardInterrupt')
+    except (EOFError, BrokenPipeError):
+        # Parent process closed, exit gracefully
+        pass
     finally:
         for env in envs:
             env.close()

@@ -238,21 +238,23 @@ class SelfplayJSBSimRunner(JSBSimRunner):
             Ra = Ra + K * (outcome - Pa)
             Rb = Rb + K * ((1 - outcome) - Pb) = Rb + K * ((1 - outcome) - (1 - Pa)) = Rb + K * (Pa - outcome)
         '''
-        ego_elo = np.array([self.latest_elo for _ in range(self.n_eval_rollout_threads)])
-        opponent_elo = np.array([self.policy_pool[key] for key in eval_choose_opponents])
-        expected_score = 1 / (1 + 10 ** ((opponent_elo - ego_elo) / 400))
+        #ego_elo = np.array([self.latest_elo for _ in range(self.n_eval_rollout_threads)])  # 当前策略的 Elo
+        ego_elo = np.array([self.latest_elo for _ in range(self.num_opponents)])  # 当前策略的 Elo
+        opponent_elo = np.array([self.policy_pool[key] for key in eval_choose_opponents])  # 对手的 Elo
+        expected_score = 1 / (1 + 10 ** ((opponent_elo - ego_elo) / 400)) # 期望得分
 
+        # 计算实际得分
         actual_score = np.zeros_like(expected_score)
         diff = eval_average_episode_rewards - opponent_average_episode_rewards
         actual_score[diff > 100] = 1 # win
         actual_score[abs(diff) < 100] = 0.5 # tie
         actual_score[diff < -100] = 0 # lose
 
-        K = 32
-        update_opponent_elo = opponent_elo + K * (expected_score - actual_score)
+        K = 32  # K 因子，决定 Elo 变化的幅度
+        update_opponent_elo = opponent_elo + K * (expected_score - actual_score) # 更新对手的 Elo
         for i, key in enumerate(eval_choose_opponents):
             self.policy_pool[key] = update_opponent_elo[i]
-        update_ego_elo = ego_elo + K * (actual_score - expected_score)
+        update_ego_elo = ego_elo + K * (actual_score - expected_score) # 更新当前策略的 Elo
         self.latest_elo = update_ego_elo.mean()
 
         # Logging

@@ -2,6 +2,7 @@ import torch
 import numpy as np
 from gymnasium import spaces
 from typing import Literal
+from types import SimpleNamespace
 from .task_base import BaseTask
 from ..core.simulatior import AircraftSimulator
 from ..core.catalog import Catalog as c
@@ -9,6 +10,8 @@ from ..termination_conditions import ExtremeState, LowAltitude, Overload, Timeou
 from ..reward_functions import AltitudeReward, PostureReward, EventDrivenReward
 from ..utils.utils import get_AO_TA_R, get2d_AO_TA_R, in_range_rad, LLA2NEU, get_root_dir
 from ..model.baseline_actor import BaselineActor
+from algorithms.ppo.ppo_actor import PPOActor
+
 
 
 class SingleCombatTask(BaseTask):
@@ -20,17 +23,17 @@ class SingleCombatTask(BaseTask):
             self.baseline_agent = self.load_agent(self.config.baseline_type)
 
         self.reward_functions = [
-            AltitudeReward(self.config),
-            PostureReward(self.config),
-            EventDrivenReward(self.config)
+            AltitudeReward(self.config), # 高度奖励
+            PostureReward(self.config), # 姿态奖励
+            EventDrivenReward(self.config) # 事件奖励
         ]
 
         self.termination_conditions = [
-            LowAltitude(self.config),
-            ExtremeState(self.config),
-            Overload(self.config),
-            SafeReturn(self.config),
-            Timeout(self.config),
+            LowAltitude(self.config), # 高度过低，终止
+            ExtremeState(self.config), # 极端状态，终止
+            Overload(self.config), # 加速过快，终止
+            SafeReturn(self.config), # 被击毁或把所有敌机击毁，终止
+            Timeout(self.config), # 到了max_step，终止
         ]
 
     @property
@@ -39,22 +42,22 @@ class SingleCombatTask(BaseTask):
 
     def load_variables(self):
         self.state_var = [
-            c.position_long_gc_deg,             # 0. lontitude  (unit: °)
-            c.position_lat_geod_deg,            # 1. latitude   (unit: °)
-            c.position_h_sl_m,                  # 2. altitude   (unit: m)
-            c.attitude_roll_rad,                # 3. roll       (unit: rad)
-            c.attitude_pitch_rad,               # 4. pitch      (unit: rad)
-            c.attitude_heading_true_rad,        # 5. yaw        (unit: rad)
-            c.velocities_v_north_mps,           # 6. v_north    (unit: m/s)
-            c.velocities_v_east_mps,            # 7. v_east     (unit: m/s)
-            c.velocities_v_down_mps,            # 8. v_down     (unit: m/s)
-            c.velocities_u_mps,                 # 9. v_body_x   (unit: m/s)
-            c.velocities_v_mps,                 # 10. v_body_y  (unit: m/s)
-            c.velocities_w_mps,                 # 11. v_body_z  (unit: m/s)
-            c.velocities_vc_mps,                # 12. vc        (unit: m/s)
-            c.accelerations_n_pilot_x_norm,     # 13. a_north   (unit: G)
-            c.accelerations_n_pilot_y_norm,     # 14. a_east    (unit: G)
-            c.accelerations_n_pilot_z_norm,     # 15. a_down    (unit: G)
+            c.position_long_gc_deg,             # 0. lontitude  (unit: °) 经度
+            c.position_lat_geod_deg,            # 1. latitude   (unit: °) 纬度
+            c.position_h_sl_m,                  # 2. altitude   (unit: m) 高度
+            c.attitude_roll_rad,                # 3. roll       (unit: rad) 横滚角度
+            c.attitude_pitch_rad,               # 4. pitch      (unit: rad) 俯仰角度
+            c.attitude_heading_true_rad,        # 5. yaw        (unit: rad) 航向角度
+            c.velocities_v_north_mps,           # 6. v_north    (unit: m/s) 北向速度
+            c.velocities_v_east_mps,            # 7. v_east     (unit: m/s) 东向速度
+            c.velocities_v_down_mps,            # 8. v_down     (unit: m/s) 向下速度
+            c.velocities_u_mps,                 # 9. v_body_x   (unit: m/s) 机体坐标系X轴速度
+            c.velocities_v_mps,                 # 10. v_body_y  (unit: m/s) 机体坐标系Y轴速度
+            c.velocities_w_mps,                 # 11. v_body_z  (unit: m/s) 机体坐标系Z轴速度
+            c.velocities_vc_mps,                # 12. vc        (unit: m/s) 校正空速
+            c.accelerations_n_pilot_x_norm,     # 13. a_north   (unit: G) 飞行员X轴过载
+            c.accelerations_n_pilot_y_norm,     # 14. a_east    (unit: G) 飞行员Y轴过载
+            c.accelerations_n_pilot_z_norm,     # 15. a_down    (unit: G) 飞行员Z轴过载
         ]
         self.action_var = [
             c.fcs_aileron_cmd_norm,             # [-1., 1.]
@@ -105,6 +108,13 @@ class SingleCombatTask(BaseTask):
         norm_obs = np.zeros(15)
         ego_obs_list = np.array(env.agents[agent_id].get_property_values(self.state_var))
         enm_obs_list = np.array(env.agents[agent_id].enemies[0].get_property_values(self.state_var))
+        # DEBUG: 检查原始状态是否有 NaN
+        if np.isnan(ego_obs_list).any() or np.isnan(enm_obs_list).any():
+            print(f"[NaN Warning] agent_id={agent_id}, step={env.current_step}")
+            print(f"  ego_obs_list NaN count: {np.isnan(ego_obs_list).sum()}")
+            print(f"  enm_obs_list NaN count: {np.isnan(enm_obs_list).sum()}")
+            print(f"  ego_obs_list: {ego_obs_list}")
+            print(f"  enm_obs_list: {enm_obs_list}")
         # (0) extract feature: [north(km), east(km), down(km), v_n(mh), v_e(mh), v_d(mh)]
         ego_cur_ned = LLA2NEU(*ego_obs_list[:3], env.center_lon, env.center_lat, env.center_alt)
         enm_cur_ned = LLA2NEU(*enm_obs_list[:3], env.center_lon, env.center_lat, env.center_alt)
@@ -203,8 +213,26 @@ class HierarchicalSingleCombatTask(SingleCombatTask):
 
     def __init__(self, config: str):
         super().__init__(config)
-        self.lowlevel_policy = BaselineActor()
-        self.lowlevel_policy.load_state_dict(torch.load(get_root_dir() + '/model/baseline_model.pt', map_location=torch.device('cpu'), weights_only=True))
+        # 使用 heading 任务训练好的 PPOActor 作为低层策略
+        heading_args = SimpleNamespace()
+        heading_args.gain = 0.01
+        heading_args.hidden_size = '128 128'
+        heading_args.act_hidden_size = '128 128'
+        heading_args.activation_id = 1
+        heading_args.use_feature_normalization = False
+        heading_args.use_recurrent_policy = True
+        heading_args.recurrent_hidden_size = 128
+        heading_args.recurrent_hidden_layers = 1
+        heading_args.use_prior = False
+
+        obs_space = spaces.Box(low=-10, high=10., shape=(12,))
+        act_space = spaces.MultiDiscrete([41, 41, 41, 30])
+        device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+
+        self.lowlevel_policy = PPOActor(heading_args, obs_space, act_space, device=device)
+        self.lowlevel_policy.load_state_dict(
+            torch.load(get_root_dir() + '/model/actor_heading.pt', map_location=device)
+        )
         self.lowlevel_policy.eval()
         self.norm_delta_altitude = np.array([0.1, 0, -0.1])
         self.norm_delta_heading = np.array([-np.pi / 6, -np.pi / 12, 0, np.pi / 12, np.pi / 6])
@@ -230,8 +258,14 @@ class HierarchicalSingleCombatTask(SingleCombatTask):
             # (2) ego info
             input_obs[3:12] = raw_obs[:9]
             input_obs = np.expand_dims(input_obs, axis=0)
-            # output low-level action
-            _action, _rnn_states = self.lowlevel_policy(input_obs, self._inner_rnn_states[agent_id])
+            # output low-level action by heading PPO actor
+            masks = np.ones((1, 1), dtype=np.float32)
+            _action, _, _rnn_states = self.lowlevel_policy(
+                input_obs,
+                self._inner_rnn_states[agent_id],
+                masks,
+                deterministic=True,
+            )
             action = _action.detach().cpu().numpy().squeeze(0)
             self._inner_rnn_states[agent_id] = _rnn_states.detach().cpu().numpy()
             # normalize low-level action

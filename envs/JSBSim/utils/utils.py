@@ -62,6 +62,9 @@ def get_AO_TA_R(ego_feature, enm_feature, return_side=False):
 
     Returns:
         (tuple): ego_AO, ego_TA, R
+        ego_AO表示我机速度方向与敌机相对位置向量之间的夹角;
+        ego_TA表示敌机速度方向与我机相对位置向量之间的夹角;
+        R表示两机之间的相对距离
     """
     ego_x, ego_y, ego_z, ego_vx, ego_vy, ego_vz = ego_feature
     ego_v = np.linalg.norm([ego_vx, ego_vy, ego_vz])

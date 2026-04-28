@@ -6,10 +6,10 @@ from .flatten import build_flattener
 class MLPLayer(nn.Module):
     def __init__(self, input_dim, hidden_size, activation_id):
         super(MLPLayer, self).__init__()
-        self._size = [input_dim] + list(map(int, hidden_size.split(' ')))
+        self._size = [input_dim] + list(map(int, hidden_size.split(' '))) # [input_dim 128 128]
         self._hidden_layers = len(self._size) - 1
         active_func = [nn.Tanh(), nn.ReLU(), nn.LeakyReLU(), nn.ELU()][activation_id]
-
+        # activation_id 默认为1
         fc_h = []
         for j in range(len(self._size) - 1):
             fc_h += [
@@ -35,7 +35,7 @@ class MLPBase(nn.Module):
         self._use_feature_normalization = use_feature_normalization
 
         self.obs_flattener = build_flattener(obs_space)
-        input_dim = self.obs_flattener.size
+        input_dim = self.obs_flattener.size # 获取展平后观测值的 维度大小
         if self._use_feature_normalization:
             self.feature_norm = nn.LayerNorm(input_dim)
         self.mlp = MLPLayer(input_dim, self._hidden_size, self._activation_id)

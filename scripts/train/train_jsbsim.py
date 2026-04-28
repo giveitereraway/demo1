@@ -43,7 +43,9 @@ def make_train_env(all_args):
         else:
             return SubprocVecEnv([get_env_fn(i) for i in range(all_args.n_rollout_threads)])
 
-
+"""
+训练环境和验证环境几乎一样,只有种子设置不同,保证训练和验证的独立性
+"""
 def make_eval_env(all_args):
     def get_env_fn(rank):
         def init_env():
@@ -82,14 +84,14 @@ def parse_args(args, parser):
 
 
 def main(args):
-    parser = get_config()
-    all_args = parse_args(args, parser)
+    parser = get_config() # 构建解析器
+    all_args = parse_args(args, parser) # 解析命令行参数
 
     # seed
-    np.random.seed(all_args.seed)
-    random.seed(all_args.seed)
-    torch.manual_seed(all_args.seed)
-    torch.cuda.manual_seed_all(all_args.seed)
+    np.random.seed(all_args.seed) # 设置NumPy随机种子，all_args.seed固定时，每次生成的随机数一样
+    random.seed(all_args.seed) # 设置Python内置随机种子
+    torch.manual_seed(all_args.seed) # 设置PyTorch CPU随机种子
+    torch.cuda.manual_seed_all(all_args.seed) # 设置PyTorch 所有GPU随机种子
 
     # cuda
     if all_args.cuda and torch.cuda.is_available():
@@ -140,7 +142,7 @@ def main(args):
     eval_envs = make_eval_env(all_args) if all_args.use_eval else None
 
     render_mode = all_args.render_mode
-    
+
     config = {
         "all_args": all_args,
         "envs": envs,
@@ -174,3 +176,15 @@ def main(args):
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     main(sys.argv[1:])
+    """
+    sys.argv[1:]指命令行中第二个参数到最后一个参数
+    sys.argv[0]指第一个参数，一般是python文件
+    例如：python train.py --model CNN --size 128 ，"train.py"就是sys.argv[0]
+
+    断点续训用法：
+    1. 正常训练：
+       python train_jsbsim.py ...
+    2. 断点续训：
+       python train_jsbsim.py --model-dir <上次训练的结果目录> ...
+       只需指定--model-dir参数，程序会自动加载该目录下的actor_latest.pt和critic_latest.pt继续训练。
+    """

@@ -71,8 +71,8 @@ class BaseSimulator(ABC):
         pass
 
     def log(self):
-        lon, lat, alt = self.get_geodetic()
-        roll, pitch, yaw = self.get_rpy() * 180 / np.pi
+        lon, lat, alt = self.get_geodetic() # 经度，纬度，高度
+        roll, pitch, yaw = self.get_rpy() * 180 / np.pi # 翻滚、俯仰、偏航角
         log_msg = f"{self.uid},T={lon}|{lat}|{alt}|{roll}|{pitch}|{yaw},"
         log_msg += f"Name={self.model.upper()},"
         log_msg += f"Color={self.color}"
@@ -162,11 +162,11 @@ class AircraftSimulator(BaseSimulator):
         self.num_left_missiles = self.num_missiles
 
         # load JSBSim FDM
-        self.jsbsim_exec = jsbsim.FGFDMExec(os.path.join(get_root_dir(), 'data'))
+        self.jsbsim_exec = jsbsim.FGFDMExec(os.path.join(get_root_dir(), 'data')) # 创建JSBSim C++仿真引擎的Python包装器实例
         self.jsbsim_exec.set_debug_level(0)
         self.jsbsim_exec.load_model(self.model)
         Catalog.add_jsbsim_props(self.jsbsim_exec.query_property_catalog(""))
-        self.jsbsim_exec.set_dt(self.dt)
+        self.jsbsim_exec.set_dt(self.dt) # 每次 jsbsim_exec.run() 推进的物理时间是 dt 秒
         self.clear_defalut_condition()
 
         # assign new properties
@@ -280,6 +280,7 @@ class AircraftSimulator(BaseSimulator):
         """
         if not len(props) == len(values):
             raise ValueError("mismatch between properties and values size")
+            #print("task里的action_var和action长度不匹配")
         for prop, value in zip(props, values):
             self.set_property_value(prop, value)
 
@@ -291,10 +292,10 @@ class AircraftSimulator(BaseSimulator):
         :return : float
         """
         if isinstance(prop, Property):
-            if prop.access == "R":
-                if prop.update:
+            if prop.access == "R": # 检查属性是否具有 读取权限
+                if prop.update: # 如果属性定义了 update 方法，则先调用该方法更新属性值
                     prop.update(self)
-            return self.jsbsim_exec.get_property_value(prop.name_jsbsim)
+            return self.jsbsim_exec.get_property_value(prop.name_jsbsim) # self.jsbsim_exec ：JSBSim C++引擎的Python包装器; prop.name_jsbsim ：属性在JSBSim中的内部名称
         else:
             raise ValueError(f"prop type unhandled: {type(prop)} ({prop})")
 
@@ -312,7 +313,7 @@ class AircraftSimulator(BaseSimulator):
             elif value > prop.max:
                 value = prop.max
 
-            self.jsbsim_exec.set_property_value(prop.name_jsbsim, value)
+            self.jsbsim_exec.set_property_value(prop.name_jsbsim, value) # 调用JSBSim的C++引擎API
 
             if "W" in prop.access:
                 if prop.update:
@@ -455,7 +456,7 @@ class MissileSimulator(BaseSimulator):
             self.__status = MissileSimulator.HIT
             self.target_aircraft.shotdown()
         elif (self._t > self._t_max) or (np.linalg.norm(self.get_velocity()) < self._v_min) \
-                or np.sum(self._distance_increment) >= self._distance_increment.maxlen or not self.target_aircraft.is_alive:
+                or np.sum(self._distance_increment) >= self._distance_increment.maxlen: #or not self.target_aircraft.is_alive:
             self.__status = MissileSimulator.MISS
         else:
             self._state_trans(action)

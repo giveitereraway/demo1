@@ -7,6 +7,7 @@ from typing import Dict, Any, Tuple
 from ..core.simulatior import AircraftSimulator, BaseSimulator
 from ..tasks.task_base import BaseTask
 from ..utils.utils import parse_config
+#from ..human_task.HumanSingleCombatTask import HumanSingleCombat_shoot_Task, HumanSingleCombatTask
 
 
 class BaseEnv(gymnasium.Env):
@@ -44,7 +45,7 @@ class BaseEnv(gymnasium.Env):
     def action_space(self) -> gymnasium.Space:
         return self.task.action_space
 
-    @property
+    @property # 将类方法转换为只读属性
     def agents(self) -> Dict[str, AircraftSimulator]:
         return self._jsbsims
 
@@ -61,7 +62,7 @@ class BaseEnv(gymnasium.Env):
         self.task = BaseTask(self.config)
 
     def load_simulator(self):
-        self._jsbsims = {}     # type: Dict[str, AircraftSimulator]
+        self._jsbsims = {} # type: Dict[str, AircraftSimulator] # 键为智能体ID，值为 AircraftSimulator 对象
         for uid, config in self.config.aircraft_configs.items():
             self._jsbsims[uid] = AircraftSimulator(
                 uid=uid,
@@ -72,9 +73,9 @@ class BaseEnv(gymnasium.Env):
                 sim_freq=self.sim_freq,
                 num_missiles=config.get("missile", 0))
         # Different teams have different uid[0]
-        _default_team_uid = list(self._jsbsims.keys())[0][0]
-        self.ego_ids = [uid for uid in self._jsbsims.keys() if uid[0] == _default_team_uid]
-        self.enm_ids = [uid for uid in self._jsbsims.keys() if uid[0] != _default_team_uid]
+        _default_team_uid = list(self._jsbsims.keys())[0][0] # 比如[0]是A0100，那么[0][0]就是A
+        self.ego_ids = [uid for uid in self._jsbsims.keys() if uid[0] == _default_team_uid] # 相同ID前缀的智能体（己方）
+        self.enm_ids = [uid for uid in self._jsbsims.keys() if uid[0] != _default_team_uid] # 不同ID前缀的智能体（敌方）
 
         # Link jsbsims
         for key, sim in self._jsbsims.items():
@@ -82,11 +83,11 @@ class BaseEnv(gymnasium.Env):
                 if k == key:
                     pass
                 elif k[0] == key[0]:
-                    sim.partners.append(s)
+                    sim.partners.append(s) # 如果是同一团队（ID首字符相同），则添加为同伴
                 else:
-                    sim.enemies.append(s)
+                    sim.enemies.append(s) # 如果是不同团队（ID首字符不同），则添加为敌人
 
-        self._tempsims = {}    # type: Dict[str, BaseSimulator]
+        self._tempsims = {}    # type: Dict[str, BaseSimulator] # 临时导弹
 
     def add_temp_simulator(self, sim: BaseSimulator):
         self._tempsims[sim.uid] = sim
@@ -126,34 +127,50 @@ class BaseEnv(gymnasium.Env):
         self.current_step += 1
         info = {"current_step": self.current_step}
         # apply actions
-        action = self._unpack(action)
-        for agent_id in self.agents.keys():
-            a_action = self.task.normalize_action(self, agent_id, action[agent_id])
+        action = self._unpack(action) # 把action从np数组转化为字典
+        #print(action) #{'A0100': array([20., 20., 20., 15.,  0.], dtype=float32), 'B0100': array([ 4., 39.,  0., 21.,  0.], dtype=float32)}
+        for agent_id in self.agents.keys(): # self.agents是self._jsbsims字典
+            #print('归一化之前：',action[agent_id])
+            #print("开始归一化")
+            a_action = self.task.normalize_action(self, agent_id, action[agent_id]) 
+            #print("结束归一化")
+            #print('归一化之后：',a_action)
+            #print(self.agents[agent_id])
             self.agents[agent_id].set_property_values(self.task.action_var, a_action)
+            """把智能体的动作a_action逐一写入到飞机仿真器的各个控制属性action_var中,从而让飞机在仿真中执行这些动作。"""
+        #print(self.task)
+
         # run simulation
+        #print("开始仿真")
         for _ in range(self.agent_interaction_steps):
-            for sim in self._jsbsims.values():
-                sim.run()
+            for sim in self._jsbsims.values(): # self._jsbsims.values()有2个
+                sim.run() # 飞行仿真，根据刚才写入的动作发生实际运动
             for sim in self._tempsims.values():
-                sim.run()
+                #print(self._tempsims.keys())
+                sim.run() # 导弹的仿真
+        #print("simulation ok")
         self.task.step(self)
-
+        #print('task.step ok')
         obs = self.get_obs()
-
+        #print('get_obs ok')
         dones = {}
         for agent_id in self.agents.keys():
             done, info = self.task.get_termination(self, agent_id, info)
             dones[agent_id] = [done]
-
+        #print(dones)
         rewards = {}
+        #print(self.agents.keys())
         for agent_id in self.agents.keys():
-            reward, info = self.task.get_reward(self, agent_id, info)
+            #print(agent_id)
+            reward, info = self.task.get_reward(self, agent_id, info) 
             rewards[agent_id] = [reward]
-
+            #print(reward)
+            #print(info)
+        #print(rewards)
         return self._pack(obs), self._pack(rewards), self._pack(dones), info
 
     def get_obs(self):
-        """Returns all agent observations in a list.
+        """Returns all agent observations in a list. 收集并返回环境中所有智能体的观测数据
 
         NOTE: Agents should have access only to their local observations
         during decentralised execution.
@@ -190,9 +207,9 @@ class BaseEnv(gymnasium.Env):
 
         if mode is:
 
-        - human: print on the terminal
-        - txt: output to txt.acmi files
-        - real_time: realtime render with tacview by socket comm
+        - human: print on the terminal 打印到终端显示
+        - txt: output to txt.acmi files 输出.acmi文件
+        - real_time: realtime render with tacview by socket comm 实时渲染
 
         Note:
 

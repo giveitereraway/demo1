@@ -82,7 +82,8 @@ class HeadingTask(BaseTask):
             10. ego v_body_z           (unit: mh)
             11. ego_vc                 (unit: mh)
         """
-        obs = np.array(env.agents[agent_id].get_property_values(self.state_var))
+        obs = np.array(env.agents[agent_id].get_property_values(self.state_var)) # 从JSBSim仿真器中获取智能体的原始状态数据
+        # env.agents 实际上是 self._jsbsims 的 属性包装器
         norm_obs = np.zeros(12)
         norm_obs[0] = obs[0] / 1000         # 0. ego delta altitude (unit: 1km)
         norm_obs[1] = obs[1] / 180 * np.pi  # 1. ego delta heading  (unit rad)
