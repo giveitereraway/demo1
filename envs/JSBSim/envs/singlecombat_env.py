@@ -1,7 +1,9 @@
 import numpy as np
 from .env_base import BaseEnv
 from ..tasks import SingleCombatTask, SingleCombatDodgeMissileTask, HierarchicalSingleCombatDodgeMissileTask, \
-    HierarchicalSingleCombatShootTask, SingleCombatShootMissileTask, HierarchicalSingleCombatTask
+    HierarchicalSingleCombatShootTask, SingleCombatShootMissileTask, HierarchicalSingleCombatTask, \
+    TacticalHierarchicalSingleCombatTask, TacticalHierarchicalSingleCombatDodgeMissileTask, \
+    TacticalHierarchicalSingleCombatShootTask
 from ..human_task.HumanSingleCombatTask import HumanSingleCombatTask, HumanSingleCombat_shoot_Task
 
 
@@ -22,6 +24,8 @@ class SingleCombatEnv(BaseEnv):
             self.task = SingleCombatTask(self.config)
         elif taskname == 'hierarchical_singlecombat':
             self.task = HierarchicalSingleCombatTask(self.config)
+        elif taskname == 'tactical_hierarchical_singlecombat':
+            self.task = TacticalHierarchicalSingleCombatTask(self.config)
         elif taskname == 'singlecombat_dodge_missile':
             self.task = SingleCombatDodgeMissileTask(self.config)
         elif taskname == 'singlecombat_shoot':
@@ -30,6 +34,10 @@ class SingleCombatEnv(BaseEnv):
             self.task = HierarchicalSingleCombatDodgeMissileTask(self.config)
         elif taskname == 'hierarchical_singlecombat_shoot':
             self.task = HierarchicalSingleCombatShootTask(self.config)
+        elif taskname == 'tactical_hierarchical_singlecombat_dodge_missile':
+            self.task = TacticalHierarchicalSingleCombatDodgeMissileTask(self.config)
+        elif taskname == 'tactical_hierarchical_singlecombat_shoot':
+            self.task = TacticalHierarchicalSingleCombatShootTask(self.config)
         elif taskname == 'HumanSingleCombat':
             self.task = HumanSingleCombatTask(self.config)
         elif taskname == 'HumanSingleCombat_shoot':

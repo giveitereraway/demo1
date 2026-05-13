@@ -2,7 +2,7 @@ import numpy as np
 from gymnasium import spaces
 from collections import deque
 
-from .singlecombat_task import SingleCombatTask, HierarchicalSingleCombatTask
+from .singlecombat_task import SingleCombatTask, HierarchicalSingleCombatTask, TacticalHierarchicalSingleCombatTask
 from ..reward_functions import AltitudeReward, PostureReward, MissilePostureReward, EventDrivenReward, ShootPenaltyReward
 from ..core.simulatior import MissileSimulator
 from ..utils.utils import LLA2NEU, get_AO_TA_R
@@ -158,6 +158,38 @@ class HierarchicalSingleCombatDodgeMissileTask(HierarchicalSingleCombatTask, Sin
         return SingleCombatDodgeMissileTask.step(self, env)
 
 
+class TacticalHierarchicalSingleCombatDodgeMissileTask(TacticalHierarchicalSingleCombatTask, SingleCombatDodgeMissileTask):
+
+    def __init__(self, config: str):
+        TacticalHierarchicalSingleCombatTask.__init__(self, config)
+
+        self.reward_functions = [
+            PostureReward(self.config),
+            MissilePostureReward(self.config),
+            AltitudeReward(self.config),
+            EventDrivenReward(self.config)
+        ]
+
+    def load_observation_space(self):
+        return SingleCombatDodgeMissileTask.load_observation_space(self)
+
+    def load_action_space(self):
+        return TacticalHierarchicalSingleCombatTask.load_action_space(self)
+
+    def get_obs(self, env, agent_id):
+        return SingleCombatDodgeMissileTask.get_obs(self, env, agent_id)
+
+    def normalize_action(self, env, agent_id, action):
+        return TacticalHierarchicalSingleCombatTask.normalize_action(self, env, agent_id, action)
+
+    def reset(self, env):
+        self._inner_rnn_states = {agent_id: np.zeros((1, 1, 128)) for agent_id in env.agents.keys()}
+        return SingleCombatDodgeMissileTask.reset(self, env)
+
+    def step(self, env):
+        return SingleCombatDodgeMissileTask.step(self, env)
+
+
 class SingleCombatShootMissileTask(SingleCombatDodgeMissileTask):
     def __init__(self, config):
         super().__init__(config)
@@ -229,6 +261,40 @@ class HierarchicalSingleCombatShootTask(HierarchicalSingleCombatTask, SingleComb
     def reset(self, env):
         self._inner_rnn_states = {agent_id: np.zeros((1, 1, 128)) for agent_id in env.agents.keys()}
         SingleCombatShootMissileTask.reset(self, env)
+
+    def step(self, env):
+        SingleCombatShootMissileTask.step(self, env)
+
+
+class TacticalHierarchicalSingleCombatShootTask(TacticalHierarchicalSingleCombatTask, SingleCombatShootMissileTask):
+    def __init__(self, config: str):
+        TacticalHierarchicalSingleCombatTask.__init__(self, config)
+        self.reward_functions = [
+            PostureReward(self.config),
+            AltitudeReward(self.config),
+            EventDrivenReward(self.config),
+            ShootPenaltyReward(self.config)
+        ]
+
+    def load_observation_space(self):
+        return SingleCombatShootMissileTask.load_observation_space(self)
+
+    def load_action_space(self):
+        # 战术机动动作 + 导弹发射动作。
+        self.action_space = spaces.Tuple([spaces.Discrete(6), spaces.Discrete(2)])
+
+    def get_obs(self, env, agent_id):
+        return SingleCombatShootMissileTask.get_obs(self, env, agent_id)
+
+    def normalize_action(self, env, agent_id, action):
+        """将战术动作和发射标志转换为低层飞控动作。"""
+        action = np.asarray(action, dtype=np.int32).reshape(-1)
+        self._shoot_action[agent_id] = action[-1]
+        return TacticalHierarchicalSingleCombatTask.normalize_action(self, env, agent_id, action[0])
+
+    def reset(self, env):
+        self._inner_rnn_states = {agent_id: np.zeros((1, 1, 128)) for agent_id in env.agents.keys()}
+        return SingleCombatShootMissileTask.reset(self, env)
 
     def step(self, env):
         SingleCombatShootMissileTask.step(self, env)

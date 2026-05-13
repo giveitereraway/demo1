@@ -37,13 +37,17 @@ class ACTLayer(nn.Module):
             for action_dim in action_dims:
                 action_outs.append(Categorical(input_dim, action_dim, gain)) # 初始化权重，Categorical是一个线性层实例
             self.action_outs = nn.ModuleList(action_outs) # 4个线性层
-        elif isinstance(act_space, gym.spaces.Tuple) and  \
-              isinstance(act_space[0], gym.spaces.MultiDiscrete) and \
-                  isinstance(act_space[1], gym.spaces.Discrete):
+        elif isinstance(act_space, gym.spaces.Tuple) and \
+              isinstance(act_space[1], gym.spaces.Discrete) and \
+              isinstance(act_space[0], (gym.spaces.MultiDiscrete, gym.spaces.Discrete)):
             # NOTE: only for shoot missile
             self._shoot_action = True
-            discrete_dims = act_space[0].nvec # [3,5,3]
-            self._discrete_dim = act_space[0].shape[0] # 3
+            if isinstance(act_space[0], gym.spaces.MultiDiscrete):
+                discrete_dims = act_space[0].nvec # [3,5,3]
+                self._discrete_dim = act_space[0].shape[0] # 3
+            else:
+                discrete_dims = [act_space[0].n]
+                self._discrete_dim = 1
             self._control_shoot_dim = 2
             self._shoot_dim = 1
             action_outs = []
@@ -92,7 +96,9 @@ class ACTLayer(nn.Module):
                 action_log_probs.append(action_log_prob)
             shoot_action_dist = self.action_outs[-1](x, **kwargs)
             shoot_action = shoot_action_dist.mode() if deterministic else shoot_action_dist.sample()
+            shoot_action_log_prob = shoot_action_dist.log_probs(shoot_action)
             actions.append(shoot_action)
+            action_log_probs.append(shoot_action_log_prob)
             actions = torch.cat(actions, dim=-1)
             action_log_probs = torch.cat(action_log_probs, dim=-1).sum(dim=-1, keepdim=True)
 

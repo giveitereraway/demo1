@@ -24,7 +24,9 @@ class TestPPO:
             gym.spaces.Box(low=-1, high=1, shape=(18,))
         ], [    # act_space
             gym.spaces.Discrete(5),
+            gym.spaces.Discrete(6),
             gym.spaces.MultiDiscrete([41, 41, 41, 30]),
+            gym.spaces.Tuple([gym.spaces.Discrete(6), gym.spaces.Discrete(2)]),
             gym.spaces.MultiBinary(4),
             gym.spaces.Box(low=-1, high=1, shape=(4,)),
         ], [    # batch_size
@@ -73,7 +75,9 @@ class TestPPO:
             gym.spaces.Box(low=-1, high=1, shape=(18,))
         ], [    # act_space
             gym.spaces.Discrete(5),
+            gym.spaces.Discrete(6),
             gym.spaces.MultiDiscrete([41, 41, 41, 30]),
+            gym.spaces.Tuple([gym.spaces.Discrete(6), gym.spaces.Discrete(2)]),
             gym.spaces.MultiBinary(4),
             gym.spaces.Box(low=-1, high=1, shape=(4,)),
         ], [    # num_mini_batch
@@ -117,7 +121,9 @@ class TestPPO:
             gym.spaces.Box(low=-1, high=1, shape=(18,))
         ], [    # act_space
             gym.spaces.Discrete(5),
+            gym.spaces.Discrete(6),
             gym.spaces.MultiDiscrete([41, 41, 41, 30]),
+            gym.spaces.Tuple([gym.spaces.Discrete(6), gym.spaces.Discrete(2)]),
             gym.spaces.MultiBinary(4),
             gym.spaces.Box(low=-1, high=1, shape=(4,)),
         ])))

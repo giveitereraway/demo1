@@ -243,47 +243,136 @@ class HierarchicalSingleCombatTask(SingleCombatTask):
     def load_action_space(self):
         self.action_space = spaces.MultiDiscrete([3, 5, 3])
 
+    def _normalize_lowlevel_action(self, action):
+        norm_act = np.zeros(4)
+        norm_act[0] = action[0] / 20 - 1.
+        norm_act[1] = action[1] / 20 - 1.
+        norm_act[2] = action[2] / 20 - 1.
+        norm_act[3] = action[3] / 58 + 0.4
+        return norm_act
+
+    def _run_lowlevel_policy(self, env, agent_id, delta_control):
+        if self.use_baseline and agent_id in env.enm_ids:
+            return self.baseline_agent.get_action(env.agents[agent_id])
+
+        # 将高层指令和本机状态拼成低层航向控制器需要的 12 维输入。
+        raw_obs = self.get_obs(env, agent_id)
+        input_obs = np.zeros(12, dtype=np.float32)
+        input_obs[0:3] = np.asarray(delta_control, dtype=np.float32)
+        input_obs[3:12] = raw_obs[:9]
+        input_obs = np.expand_dims(input_obs, axis=0)
+
+        masks = np.ones((1, 1), dtype=np.float32)
+        with torch.no_grad():
+            _action, _, _rnn_states = self.lowlevel_policy(
+                input_obs,
+                self._inner_rnn_states[agent_id],
+                masks,
+                deterministic=True,
+            )
+        action = _action.detach().cpu().numpy().squeeze(0)
+        self._inner_rnn_states[agent_id] = _rnn_states.detach().cpu().numpy()
+        return self._normalize_lowlevel_action(action)
+
     def normalize_action(self, env, agent_id, action):
         """Convert high-level action into low-level action.
         """
-        if self.use_baseline and agent_id in env.enm_ids:
-            action = self.baseline_agent.get_action(env.agents[agent_id])
-            return action
-        else:
-            # generate low-level input_obs
-            raw_obs = self.get_obs(env, agent_id)
-            input_obs = np.zeros(12)
-            # (1) delta altitude/heading/velocity
-            input_obs[0] = self.norm_delta_altitude[action[0]]
-            input_obs[1] = self.norm_delta_heading[action[1]]
-            input_obs[2] = self.norm_delta_velocity[action[2]]
-            # (2) ego info
-            input_obs[3:12] = raw_obs[:9]
-            input_obs = np.expand_dims(input_obs, axis=0)
-            # output low-level action by heading PPO actor
-            masks = np.ones((1, 1), dtype=np.float32)
-            with torch.no_grad():
-                _action, _, _rnn_states = self.lowlevel_policy(
-                    input_obs,
-                    self._inner_rnn_states[agent_id],
-                    masks,
-                    deterministic=True,
-                )
-            action = _action.detach().cpu().numpy().squeeze(0)
-            self._inner_rnn_states[agent_id] = _rnn_states.detach().cpu().numpy()
-            # normalize low-level action
-            norm_act = np.zeros(4)
-            norm_act[0] = action[0] / 20 - 1.
-            norm_act[1] = action[1] / 20 - 1.
-            norm_act[2] = action[2] / 20 - 1.
-            norm_act[3] = action[3] / 58 + 0.4
-            return norm_act
+        action = np.asarray(action, dtype=np.int32).reshape(-1)
+        delta_control = np.array([
+            self.norm_delta_altitude[action[0]],
+            self.norm_delta_heading[action[1]],
+            self.norm_delta_velocity[action[2]],
+        ], dtype=np.float32)
+        return self._run_lowlevel_policy(env, agent_id, delta_control)
 
     def reset(self, env):
         """Task-specific reset, include reward function reset.
         """
         self._inner_rnn_states = {agent_id: np.zeros((1, 1, 128)) for agent_id in env.agents.keys()}
         return super().reset(env)
+
+
+class TacticalHierarchicalSingleCombatTask(HierarchicalSingleCombatTask):
+    PURSUE = 0
+    DISENGAGE = 1
+    CLIMB = 2
+    DIVE = 3
+    TURN_LEFT = 4
+    TURN_RIGHT = 5
+
+    def load_action_space(self):
+        self.action_space = spaces.Discrete(6)
+
+    def _heading_error_to_vector(self, env, agent_id, target_xy):
+        ego = env.agents[agent_id]
+        ego_xy = np.asarray(ego.get_velocity()[:2], dtype=np.float32)
+        target_xy = np.asarray(target_xy, dtype=np.float32)
+
+        if np.linalg.norm(ego_xy) < 1e-6:
+            heading = ego.get_property_value(c.attitude_heading_true_rad)
+            ego_xy = np.array([np.cos(heading), np.sin(heading)], dtype=np.float32)
+        if np.linalg.norm(target_xy) < 1e-6:
+            return 0.0
+
+        ego_xy = ego_xy / (np.linalg.norm(ego_xy) + 1e-8)
+        target_xy = target_xy / (np.linalg.norm(target_xy) + 1e-8)
+        dot = np.clip(np.dot(ego_xy, target_xy), -1.0, 1.0)
+        # 二维向量叉积只需要 z 分量，用来判断目标在当前速度方向的左/右侧。
+        cross_z = ego_xy[0] * target_xy[1] - ego_xy[1] * target_xy[0]
+        heading_error = np.arctan2(cross_z, dot)
+        return np.clip(heading_error, -np.pi / 6, np.pi / 6)
+
+    def _altitude_step_to_enemy(self, env, agent_id):
+        ego = env.agents[agent_id]
+        enm = ego.enemies[0]
+        delta_altitude = enm.get_property_value(c.position_h_sl_m) - ego.get_property_value(c.position_h_sl_m)
+        if delta_altitude > 250:
+            return 0.1
+        if delta_altitude < -250:
+            return -0.1
+        return 0.0
+
+    def _tactical_action_to_delta_control(self, env, agent_id, action_id):
+        ego = env.agents[agent_id]
+        enm = ego.enemies[0]
+        relative_xy = np.asarray((enm.get_position() - ego.get_position())[:2], dtype=np.float32)
+        if np.linalg.norm(relative_xy) < 1e-6:
+            relative_xy = np.asarray(ego.get_velocity()[:2], dtype=np.float32)
+
+        target_xy = relative_xy
+        delta_altitude = 0.0
+        delta_velocity = 0.0
+
+        if action_id == self.PURSUE:
+            target_xy = relative_xy
+            delta_altitude = self._altitude_step_to_enemy(env, agent_id)
+            delta_velocity = 0.05
+        elif action_id == self.DISENGAGE:
+            target_xy = -relative_xy
+            delta_velocity = 0.05
+        elif action_id == self.CLIMB:
+            target_xy = relative_xy
+            delta_altitude = 0.1
+            delta_velocity = -0.05
+        elif action_id == self.DIVE:
+            target_xy = relative_xy
+            delta_altitude = -0.1
+            delta_velocity = 0.05
+        elif action_id == self.TURN_LEFT:
+            target_xy = np.array([-relative_xy[1], relative_xy[0]], dtype=np.float32)
+        elif action_id == self.TURN_RIGHT:
+            target_xy = np.array([relative_xy[1], -relative_xy[0]], dtype=np.float32)
+        else:
+            raise ValueError(f"Unknown tactical action id: {action_id}")
+
+        delta_heading = self._heading_error_to_vector(env, agent_id, target_xy)
+        return np.array([delta_altitude, delta_heading, delta_velocity], dtype=np.float32)
+
+    def normalize_action(self, env, agent_id, action):
+        """将战术动作编号转换为低层飞控动作。"""
+        action_id = int(np.asarray(action).reshape(-1)[0])
+        delta_control = self._tactical_action_to_delta_control(env, agent_id, action_id)
+        return self._run_lowlevel_policy(env, agent_id, delta_control)
 
 
 class StraightFlyAgent:

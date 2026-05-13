@@ -3,6 +3,7 @@ import os
 import pytest
 import torch
 import random
+import gymnasium as gym
 import numpy as np
 from pathlib import Path
 from itertools import product
@@ -143,6 +144,56 @@ class TestSingleCombatEnv:
             assert np.linalg.norm(obs - obs_buf[t + 1]) < 1e-8 \
                 and np.all(rewards == rew_buf[t]) and np.all(dones == done_buff[t])
             t += 1
+
+    @pytest.mark.parametrize("config, is_shoot", [
+        ("1v1/NoWeapon/TacticalHierarchySelfplay", False),
+        ("1v1/DodgeMissile/TacticalHierarchySelfplay", False),
+        ("1v1/ShootMissile/TacticalHierarchySelfplay", True),
+    ])
+    def test_tactical_hierarchy_env(self, config, is_shoot):
+        env = SingleCombatEnv(config)
+        assert isinstance(env.action_space, gym.spaces.Tuple if is_shoot else gym.spaces.Discrete)
+        if is_shoot:
+            assert isinstance(env.action_space[0], gym.spaces.Discrete)
+            assert env.action_space[0].n == 6 and env.action_space[1].n == 2
+        else:
+            assert env.action_space.n == 6
+
+        obs_shape = (env.num_agents, *env.observation_space.shape)
+        reward_shape = (env.num_agents, 1)
+        done_shape = (env.num_agents, 1)
+
+        env.seed(0)
+        env.action_space.seed(0)
+        obs = env.reset()
+        assert obs.shape == obs_shape
+
+        obs_buf = [obs]
+        act_buf = []
+        rew_buf = []
+        done_buf = []
+        for _ in range(3):
+            actions = [env.action_space.sample() for _ in range(env.num_agents)]
+            obs, rewards, dones, info = env.step(actions)
+            assert obs.shape == obs_shape
+            assert rewards.shape == reward_shape
+            assert dones.shape == done_shape
+            obs_buf.append(obs)
+            act_buf.append(actions)
+            rew_buf.append(rewards)
+            done_buf.append(dones)
+            if np.all(dones):
+                break
+
+        env.seed(0)
+        obs = env.reset()
+        assert np.linalg.norm(obs - obs_buf[0]) < 1e-8
+        for t, actions in enumerate(act_buf):
+            obs, rewards, dones, info = env.step(actions)
+            assert np.linalg.norm(obs - obs_buf[t + 1]) < 1e-8
+            assert np.allclose(rewards, rew_buf[t])
+            assert np.all(dones == done_buf[t])
+        env.close()
 
     @pytest.mark.parametrize("config", ["1v1/NoWeapon/vsBaseline", "1v1/NoWeapon/Selfplay"])
     def test_agent_crash(self, config):

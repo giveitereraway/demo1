@@ -19,10 +19,13 @@ def get_shape_from_space(space):
             or isinstance(space, gym.spaces.MultiDiscrete) \
             or isinstance(space, gym.spaces.MultiBinary):
         return space.shape
-    elif isinstance(space,gym.spaces.Tuple) and \
-           isinstance(space[0], gym.spaces.MultiDiscrete) and \
-               isinstance(space[1], gym.spaces.Discrete):
-        return (space[0].shape[0] + 1,)
+    elif isinstance(space,gym.spaces.Tuple) and isinstance(space[1], gym.spaces.Discrete):
+        if isinstance(space[0], gym.spaces.MultiDiscrete):
+            return (space[0].shape[0] + 1,)
+        elif isinstance(space[0], gym.spaces.Discrete):
+            return (2,)
+        else:
+            raise NotImplementedError(f"Unsupported action space type: {type(space[0])}!")
     else:
         raise NotImplementedError(f"Unsupported action space type: {type(space)}!")
 
