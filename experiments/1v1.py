@@ -14,6 +14,15 @@ import numpy as np
 import torch
 from gymnasium import spaces
 
+# matplotlib 只用于实验后处理，缺失时不影响对战评估。
+try:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+except Exception:
+    plt = None
+
 
 # 让脚本可以从 experiments/ 目录直接导入项目代码。
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -43,7 +52,7 @@ ACTOR_B_SCENARIO_NAME = "1v1/NoWeapon/HierarchySelfplay"
 # 分层 actor 的低层控制器。
 LOWLEVEL_ACTOR_PATH = REPO_ROOT / "envs/JSBSim/model/actor_heading.pt"
 
-NUM_EPISODES = 10
+NUM_EPISODES = 50
 SEED = 1
 DEVICE = "cuda:0"  # auto / cpu / cuda:0
 DETERMINISTIC = True
@@ -65,6 +74,13 @@ CUSTOM_INITIAL_STATES = None
 SAVE_ACMI = True
 ACMI_EPISODES = {0}  # 只保存指定回合，避免大量轨迹文件。
 OUTPUT_ROOT = REPO_ROOT / "experiments/results"
+
+# 是否在实验结束后保存图表，默认输出到结果目录下的 plots/。
+SAVE_PLOTS = True
+PLOT_DPI = 180
+MOVING_AVERAGE_WINDOW = 5
+PLOT_ONLY_RESULT_DIR = None
+#PLOT_ONLY_RESULT_DIR = OUTPUT_ROOT / "selfA_vs_hierarchyselfB_20260513_104605"
 
 # 当前 BetaShootBernoulli 内部有调试 print，射击任务中建议保持开启。
 SUPPRESS_POLICY_DEBUG_PRINT = True
@@ -381,6 +397,8 @@ def make_output_dir() -> Path:
     output_dir.mkdir(parents=True, exist_ok=False)
     if SAVE_ACMI:
         (output_dir / "acmi").mkdir(parents=True, exist_ok=True)
+    if SAVE_PLOTS:
+        (output_dir / "plots").mkdir(parents=True, exist_ok=True)
     return output_dir
 
 
@@ -391,6 +409,23 @@ def save_csv(rows: List[Dict[str, object]], path: Path) -> None:
         writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         writer.writeheader()
         writer.writerows(rows)
+
+
+def load_csv(path: Path) -> List[Dict[str, object]]:
+    with path.open("r", newline="", encoding="utf-8-sig") as f:
+        return list(csv.DictReader(f))
+
+
+def save_summary(summary: Dict[str, object], path: Path) -> None:
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+
+
+def load_summary(path: Path) -> Dict[str, object]:
+    if not path.exists():
+        return {}
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
 
 
 def average(rows: List[Dict[str, object]], key: str) -> float:
@@ -437,6 +472,272 @@ def build_summary(rows: List[Dict[str, object]], output_dir: Path) -> Dict[str, 
         "actor_b_missile_hit_rate": actor_b_hits / actor_b_launched if actor_b_launched else 0.0,
     }
     return summary
+
+
+def configure_plot_style() -> None:
+    """配置适合中文实验图表的 matplotlib 样式。"""
+    if plt is None:
+        return
+    plt.rcParams.update(
+        {
+            "font.sans-serif": [
+                "Microsoft YaHei",
+                "SimHei",
+                "Noto Sans CJK SC",
+                "Arial Unicode MS",
+                "DejaVu Sans",
+            ],
+            "axes.unicode_minus": False,
+            "figure.autolayout": True,
+        }
+    )
+
+
+def numeric_series(rows: List[Dict[str, object]], key: str) -> np.ndarray:
+    return np.asarray([float(row[key]) for row in rows], dtype=np.float64)
+
+
+def moving_average(values: np.ndarray, window: int) -> Tuple[np.ndarray, np.ndarray]:
+    """计算滑动平均，用于在回合数较多时观察整体趋势。"""
+    if window <= 1 or values.size < window:
+        return np.asarray([], dtype=np.int64), np.asarray([], dtype=np.float64)
+    kernel = np.ones(window, dtype=np.float64) / float(window)
+    averaged = np.convolve(values, kernel, mode="valid")
+    x_offset = np.arange(window - 1, values.size, dtype=np.int64)
+    return x_offset, averaged
+
+
+def save_plot(fig, plot_dir: Path, filename: str) -> Path:
+    path = plot_dir / filename
+    fig.savefig(path, dpi=PLOT_DPI, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
+def add_line_with_average(
+    ax,
+    episode_ids: np.ndarray,
+    values: np.ndarray,
+    label: str,
+    color: str,
+) -> None:
+    ax.plot(episode_ids, values, marker="o", linewidth=1.8, label=label, color=color)
+    avg_x, avg_y = moving_average(values, MOVING_AVERAGE_WINDOW)
+    if avg_y.size:
+        ax.plot(
+            episode_ids[avg_x],
+            avg_y,
+            linestyle="--",
+            linewidth=2.0,
+            label=f"{label} {MOVING_AVERAGE_WINDOW}局滑动平均",
+            color=color,
+            alpha=0.75,
+        )
+
+
+def plot_reward_curve(rows: List[Dict[str, object]], plot_dir: Path) -> Path:
+    episode_ids = numeric_series(rows, "episode")
+    actor_a_rewards = numeric_series(rows, "actor_a_reward")
+    actor_b_rewards = numeric_series(rows, "actor_b_reward")
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    add_line_with_average(ax, episode_ids, actor_a_rewards, "Actor A", "#1f77b4")
+    add_line_with_average(ax, episode_ids, actor_b_rewards, "Actor B", "#d62728")
+    ax.set_title("各回合累计奖励曲线")
+    ax.set_xlabel("Episode")
+    ax.set_ylabel("累计奖励")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    return save_plot(fig, plot_dir, "reward_curve.png")
+
+
+def plot_reward_margin(rows: List[Dict[str, object]], plot_dir: Path) -> Path:
+    episode_ids = numeric_series(rows, "episode")
+    reward_margin = numeric_series(rows, "reward_margin")
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    add_line_with_average(ax, episode_ids, reward_margin, "A-B 奖励差", "#2ca02c")
+    ax.axhline(0.0, color="#333333", linewidth=1.0)
+    ax.axhline(WIN_REWARD_MARGIN, color="#999999", linestyle=":", linewidth=1.2)
+    ax.axhline(-WIN_REWARD_MARGIN, color="#999999", linestyle=":", linewidth=1.2)
+    ax.fill_between(
+        episode_ids,
+        -WIN_REWARD_MARGIN,
+        WIN_REWARD_MARGIN,
+        color="#999999",
+        alpha=0.08,
+        label="平局奖励差区间",
+    )
+    ax.set_title("各回合奖励差曲线")
+    ax.set_xlabel("Episode")
+    ax.set_ylabel("Actor A 奖励 - Actor B 奖励")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    return save_plot(fig, plot_dir, "reward_margin_curve.png")
+
+
+def plot_outcome_curve(rows: List[Dict[str, object]], plot_dir: Path) -> Path:
+    episode_ids = numeric_series(rows, "episode")
+    winners = [str(row["winner"]) for row in rows]
+    episode_count = np.arange(1, len(rows) + 1, dtype=np.float64)
+    actor_a_rate = np.cumsum([winner == "actor_a" for winner in winners]) / episode_count
+    actor_b_rate = np.cumsum([winner == "actor_b" for winner in winners]) / episode_count
+    tie_rate = np.cumsum([winner == "tie" for winner in winners]) / episode_count
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.8))
+    labels = ["Actor A胜", "Actor B胜", "平局"]
+    counts = [
+        winners.count("actor_a"),
+        winners.count("actor_b"),
+        winners.count("tie"),
+    ]
+    bars = axes[0].bar(labels, counts, color=["#1f77b4", "#d62728", "#7f7f7f"])
+    axes[0].set_title("胜负结果统计")
+    axes[0].set_ylabel("回合数")
+    for bar in bars:
+        height = bar.get_height()
+        axes[0].annotate(
+            f"{int(height)}",
+            xy=(bar.get_x() + bar.get_width() / 2, height),
+            xytext=(0, 3),
+            textcoords="offset points",
+            ha="center",
+            va="bottom",
+        )
+
+    axes[1].plot(episode_ids, actor_a_rate, marker="o", label="Actor A累计胜率")
+    axes[1].plot(episode_ids, actor_b_rate, marker="o", label="Actor B累计胜率")
+    axes[1].plot(episode_ids, tie_rate, marker="o", label="累计平局率")
+    axes[1].set_title("累计胜率/平局率")
+    axes[1].set_xlabel("Episode")
+    axes[1].set_ylabel("比例")
+    axes[1].set_ylim(-0.02, 1.02)
+    axes[1].grid(True, alpha=0.3)
+    axes[1].legend()
+    return save_plot(fig, plot_dir, "outcome_curve.png")
+
+
+def plot_terminal_metrics(rows: List[Dict[str, object]], plot_dir: Path) -> Path:
+    episode_ids = numeric_series(rows, "episode")
+    steps = numeric_series(rows, "steps")
+    duration_sec = numeric_series(rows, "duration_sec")
+    actor_a_bloods = numeric_series(rows, "actor_a_bloods")
+    actor_b_bloods = numeric_series(rows, "actor_b_bloods")
+
+    fig, axes = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+    axes[0].plot(episode_ids, steps, marker="o", label="步数", color="#9467bd")
+    axes[0].plot(episode_ids, duration_sec, marker="s", label="仿真时长(s)", color="#8c564b")
+    axes[0].set_title("每回合终止步数与仿真时长")
+    axes[0].set_ylabel("数值")
+    axes[0].grid(True, alpha=0.3)
+    axes[0].legend()
+
+    axes[1].plot(episode_ids, actor_a_bloods, marker="o", label="Actor A血量", color="#1f77b4")
+    axes[1].plot(episode_ids, actor_b_bloods, marker="o", label="Actor B血量", color="#d62728")
+    axes[1].set_title("每回合终局血量")
+    axes[1].set_xlabel("Episode")
+    axes[1].set_ylabel("血量")
+    axes[1].set_ylim(-5, max(105.0, float(np.max([actor_a_bloods.max(), actor_b_bloods.max()])) + 5))
+    axes[1].grid(True, alpha=0.3)
+    axes[1].legend()
+    return save_plot(fig, plot_dir, "terminal_metrics.png")
+
+
+def plot_status_counts(rows: List[Dict[str, object]], plot_dir: Path) -> Path:
+    statuses = ["alive", "crash", "shotdown", "unknown"]
+    status_labels = ["存活", "坠毁", "被击落", "未知"]
+    actor_a_counts = [sum(row["actor_a_status"] == status for row in rows) for status in statuses]
+    actor_b_counts = [sum(row["actor_b_status"] == status for row in rows) for status in statuses]
+    x = np.arange(len(statuses))
+    width = 0.36
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    ax.bar(x - width / 2, actor_a_counts, width, label="Actor A", color="#1f77b4")
+    ax.bar(x + width / 2, actor_b_counts, width, label="Actor B", color="#d62728")
+    ax.set_title("终局状态统计")
+    ax.set_xticks(x)
+    ax.set_xticklabels(status_labels)
+    ax.set_ylabel("回合数")
+    ax.grid(True, axis="y", alpha=0.3)
+    ax.legend()
+    return save_plot(fig, plot_dir, "status_counts.png")
+
+
+def plot_missile_stats(rows: List[Dict[str, object]], plot_dir: Path) -> Optional[Path]:
+    missile_keys = [
+        "actor_a_missiles_launched",
+        "actor_b_missiles_launched",
+        "actor_a_missile_hits",
+        "actor_b_missile_hits",
+        "actor_a_missiles_remaining",
+        "actor_b_missiles_remaining",
+    ]
+    if not any(float(row[key]) > 0 for row in rows for key in missile_keys):
+        return None
+
+    episode_ids = numeric_series(rows, "episode")
+    actor_a_launched = numeric_series(rows, "actor_a_missiles_launched")
+    actor_b_launched = numeric_series(rows, "actor_b_missiles_launched")
+    actor_a_hits = numeric_series(rows, "actor_a_missile_hits")
+    actor_b_hits = numeric_series(rows, "actor_b_missile_hits")
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.8))
+    width = 0.35
+    axes[0].bar(episode_ids - width / 2, actor_a_launched, width, label="Actor A发射")
+    axes[0].bar(episode_ids + width / 2, actor_b_launched, width, label="Actor B发射")
+    axes[0].set_title("各回合导弹发射数")
+    axes[0].set_xlabel("Episode")
+    axes[0].set_ylabel("发射数")
+    axes[0].grid(True, axis="y", alpha=0.3)
+    axes[0].legend()
+
+    axes[1].bar(episode_ids - width / 2, actor_a_hits, width, label="Actor A命中")
+    axes[1].bar(episode_ids + width / 2, actor_b_hits, width, label="Actor B命中")
+    axes[1].set_title("各回合导弹命中数")
+    axes[1].set_xlabel("Episode")
+    axes[1].set_ylabel("命中数")
+    axes[1].grid(True, axis="y", alpha=0.3)
+    axes[1].legend()
+    return save_plot(fig, plot_dir, "missile_stats.png")
+
+
+def plot_results(rows: List[Dict[str, object]], output_dir: Path) -> List[Path]:
+    if not SAVE_PLOTS:
+        return []
+    if plt is None:
+        print("未安装 matplotlib，跳过图表绘制。可安装 matplotlib 后重新运行。")
+        return []
+    if not rows:
+        return []
+
+    configure_plot_style()
+    plot_dir = output_dir / "plots"
+    plot_dir.mkdir(parents=True, exist_ok=True)
+
+    plot_paths = [
+        plot_reward_curve(rows, plot_dir),
+        plot_reward_margin(rows, plot_dir),
+        plot_outcome_curve(rows, plot_dir),
+        plot_terminal_metrics(rows, plot_dir),
+        plot_status_counts(rows, plot_dir),
+    ]
+    missile_plot = plot_missile_stats(rows, plot_dir)
+    if missile_plot is not None:
+        plot_paths.append(missile_plot)
+
+    with (plot_dir / "plot_index.json").open("w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "plot_files": [str(path) for path in plot_paths],
+                "moving_average_window": MOVING_AVERAGE_WINDOW,
+                "note": "reward_margin 为 Actor A 累计奖励减 Actor B 累计奖励。",
+            },
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
+    print(f"图表目录: {plot_dir}")
+    return plot_paths
 
 
 def run_episode(
@@ -530,7 +831,26 @@ def run_episode(
     return row
 
 
+def plot_existing_results(result_dir: Path) -> None:
+    """只读取已有 episodes.csv 并补充生成图表。"""
+    episodes_path = result_dir / "episodes.csv"
+    summary_path = result_dir / "summary.json"
+    if not episodes_path.exists():
+        raise FileNotFoundError(f"未找到已有结果文件: {episodes_path}")
+
+    rows = load_csv(episodes_path)
+    summary = load_summary(summary_path) or build_summary(rows, result_dir)
+    plot_files = plot_results(rows, result_dir)
+    summary["plot_files"] = [str(path) for path in plot_files]
+    save_summary(summary, summary_path)
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+
+
 def main() -> None:
+    if PLOT_ONLY_RESULT_DIR is not None:
+        plot_existing_results(Path(PLOT_ONLY_RESULT_DIR))
+        return
+
     np.random.seed(SEED)
     torch.manual_seed(SEED)
 
@@ -568,8 +888,9 @@ def main() -> None:
 
     save_csv(rows, output_dir / "episodes.csv")
     summary = build_summary(rows, output_dir)
-    with (output_dir / "summary.json").open("w", encoding="utf-8") as f:
-        json.dump(summary, f, ensure_ascii=False, indent=2)
+    plot_files = plot_results(rows, output_dir)
+    summary["plot_files"] = [str(path) for path in plot_files]
+    save_summary(summary, output_dir / "summary.json")
 
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 
