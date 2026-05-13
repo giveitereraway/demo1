@@ -227,13 +227,15 @@ class HierarchicalSingleCombatTask(SingleCombatTask):
 
         obs_space = spaces.Box(low=-10, high=10., shape=(12,))
         act_space = spaces.MultiDiscrete([41, 41, 41, 30])
-        device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+        # 低层控制器会在每个 rollout 子进程中各加载一份，固定放在 CPU 可避免多进程抢占显存。
+        device = torch.device("cpu")
 
         self.lowlevel_policy = PPOActor(heading_args, obs_space, act_space, device=device)
         self.lowlevel_policy.load_state_dict(
             torch.load(get_root_dir() + '/model/actor_heading.pt', map_location=device)
         )
         self.lowlevel_policy.eval()
+        self.lowlevel_policy.requires_grad_(False)
         self.norm_delta_altitude = np.array([0.1, 0, -0.1])
         self.norm_delta_heading = np.array([-np.pi / 6, -np.pi / 12, 0, np.pi / 12, np.pi / 6])
         self.norm_delta_velocity = np.array([0.05, 0, -0.05])
@@ -260,12 +262,13 @@ class HierarchicalSingleCombatTask(SingleCombatTask):
             input_obs = np.expand_dims(input_obs, axis=0)
             # output low-level action by heading PPO actor
             masks = np.ones((1, 1), dtype=np.float32)
-            _action, _, _rnn_states = self.lowlevel_policy(
-                input_obs,
-                self._inner_rnn_states[agent_id],
-                masks,
-                deterministic=True,
-            )
+            with torch.no_grad():
+                _action, _, _rnn_states = self.lowlevel_policy(
+                    input_obs,
+                    self._inner_rnn_states[agent_id],
+                    masks,
+                    deterministic=True,
+                )
             action = _action.detach().cpu().numpy().squeeze(0)
             self._inner_rnn_states[agent_id] = _rnn_states.detach().cpu().numpy()
             # normalize low-level action

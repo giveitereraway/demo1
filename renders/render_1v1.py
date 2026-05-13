@@ -32,11 +32,12 @@ render = True
 ego_policy_index = 1040
 enm_policy_index = 0
 episode_rewards = 0
-ego_run_dir = "/home/lqh/jyh/CloseAirCombat/scripts/results/SingleCombat/1v1/NoWeapon/HierarchySelfplay/ppo/artillery_check/wandb/latest-run/files"
-enm_run_dir = "/home/lqh/jyh/CloseAirCombat/scripts/results/SingleCombat/1v1/NoWeapon/HierarchySelfplay/ppo/artillery_check/wandb/latest-run/files"
-experiment_name = ego_run_dir.split('/')[-4] # ego_run_dir路径中的倒数第4个目录
+ego_run_dir = "E:/clone/demo1/scripts/results/SingleCombat/1v1/NoWeapon/Selfplay/ppo/1v1_follow/wandb/offline-run-20260512_175151-yryla8wg/files"
+enm_run_dir = "E:/clone/demo1/scripts/results/SingleCombat/1v1/NoWeapon/Selfplay/ppo/1v1_follow/wandb/offline-run-20260512_175151-yryla8wg/files"
+#experiment_name = ego_run_dir.split('/')[-4] # ego_run_dir路径中的倒数第4个目录
+experiment_name = "selfplay"
 
-env = SingleControlEnv("1/heading")
+env = SingleCombatEnv("1v1/NoWeapon/Selfplay")
 env.seed(0)
 args = Args()
 
@@ -44,8 +45,10 @@ ego_policy = PPOActor(args, env.observation_space, env.action_space, device=torc
 enm_policy = PPOActor(args, env.observation_space, env.action_space, device=torch.device("cuda"))
 ego_policy.eval() # 设置为验证模式，不使用Dropout和BatchNorm，相当于.train(False)
 enm_policy.eval()
-ego_policy.load_state_dict(torch.load(ego_run_dir + f"/actor_{ego_policy_index}.pt")) # 将预训练的参数权重加载到新的模型之中
-enm_policy.load_state_dict(torch.load(enm_run_dir + f"/actor_{enm_policy_index}.pt"))
+#ego_policy.load_state_dict(torch.load(ego_run_dir + f"/actor_{ego_policy_index}.pt")) # 将预训练的参数权重加载到新的模型之中
+#enm_policy.load_state_dict(torch.load(enm_run_dir + f"/actor_{enm_policy_index}.pt"))
+ego_policy.load_state_dict(torch.load(ego_run_dir + "/actor_latest.pt"))
+enm_policy.load_state_dict(torch.load(enm_run_dir + "/actor_latest.pt"))
 
 
 print("Start render")

@@ -117,8 +117,11 @@ class Runner(object):
 
     def log_info(self, infos, total_num_steps):
         if self.use_wandb:
-            for k, v in infos.items():
-                wandb.log({k: v}, step=total_num_steps)
+            try:
+                wandb.log(infos, step=total_num_steps)
+            except Exception as e:
+                logging.warning(f"WandB logging failed, disable WandB logging and continue training: {e}")
+                self.use_wandb = False
         else:
             pass
         

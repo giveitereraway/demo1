@@ -209,7 +209,7 @@ def print_flight_summary(flight_data: Dict[str, Dict[str, List]]):
 def main():
     """主函数"""
     # 数据文件路径
-    data_file = 'scripts/agent_follow_human'
+    data_file = 'hierarchy1_follow_hierarchy2.txt.acmi'
     
     print("开始解析飞行轨迹数据...")
     
