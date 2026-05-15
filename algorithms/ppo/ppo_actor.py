@@ -46,8 +46,8 @@ class PPOActor(nn.Module):
             distance = obs[:, 13] * 10000 # unit m
             alpha0 = torch.full(size=(obs.shape[0],1), fill_value=3).to(**self.tpdv)
             beta0 = torch.full(size=(obs.shape[0],1), fill_value=10).to(**self.tpdv)
-            alpha0[distance<=12000] = 65 # 原本是6 90最佳
-            alpha0[distance<=8000] = 70 # 原本是10 95最佳
+            alpha0[distance<=12000] = 6 # 原本是6 90最佳
+            alpha0[distance<=8000] = 10 # 原本是10 95最佳
             beta0[attack_angle<=45] = 6
             beta0[attack_angle<=22.5] = 3
         actor_features = self.base(obs) # 首先经过MLP层

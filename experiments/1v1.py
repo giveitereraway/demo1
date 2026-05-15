@@ -31,13 +31,14 @@ if str(REPO_ROOT) not in sys.path:
 
 from algorithms.ppo.ppo_actor import PPOActor
 from envs.JSBSim.envs import SingleCombatEnv
+from envs.JSBSim.utils.utils import get_AO_TA_R
 
 
 # =========================
 # 可修改实验配置
 # =========================
 
-EXPERIMENT_NAME = "selfA_vs_hierarchyselfB"
+EXPERIMENT_NAME = "selfA_vs_hierarchyself_3B"
 
 # 评估环境必须使用直接控制版 SingleCombat 场景。
 EVAL_SCENARIO_NAME = "1v1/NoWeapon/Selfplay"
@@ -46,7 +47,7 @@ EVAL_SCENARIO_NAME = "1v1/NoWeapon/Selfplay"
 ACTOR_A_PATH = REPO_ROOT / "scripts/results/SingleCombat/1v1/NoWeapon/Selfplay/ppo/1v1_follow/wandb/offline-run-20260512_175151-yryla8wg/files/actor_latest.pt"
 ACTOR_A_SCENARIO_NAME = "1v1/NoWeapon/Selfplay"
 
-ACTOR_B_PATH = REPO_ROOT / "scripts/results/SingleCombat/1v1/NoWeapon/HierarchySelfplay/ppo/1v1_follow_hierarchy_2/wandb/run-20260129_153747-15x1ugrb/files/actor_latest.pt"
+ACTOR_B_PATH = REPO_ROOT / "scripts/results/SingleCombat/1v1/NoWeapon/HierarchySelfplay/ppo/1v1_follow_hierarchy_3/wandb/offline-run-20260513_112510-k33hp7hh/files/actor_latest.pt"
 ACTOR_B_SCENARIO_NAME = "1v1/NoWeapon/HierarchySelfplay"
 
 # 分层 actor 的低层控制器。
@@ -432,6 +433,33 @@ def average(rows: List[Dict[str, object]], key: str) -> float:
     return float(np.mean([float(row[key]) for row in rows])) if rows else 0.0
 
 
+def metric_values(rows: List[Dict[str, object]], key: str) -> List[float]:
+    """读取某个指标列，兼容旧版 episodes.csv 中不存在新指标的情况。"""
+    values = []
+    for row in rows:
+        if key not in row or row[key] in ("", None):
+            continue
+        values.append(float(row[key]))
+    return values
+
+
+def metric_mean(rows: List[Dict[str, object]], key: str) -> float:
+    values = metric_values(rows, key)
+    return float(np.mean(values)) if values else 0.0
+
+
+def metric_std(rows: List[Dict[str, object]], key: str) -> float:
+    """按回合样本计算标准差；只有 1 个样本时记为 0。"""
+    values = metric_values(rows, key)
+    if len(values) <= 1:
+        return 0.0
+    return float(np.std(values, ddof=1))
+
+
+def has_metric(rows: List[Dict[str, object]], key: str) -> bool:
+    return bool(metric_values(rows, key))
+
+
 def build_summary(rows: List[Dict[str, object]], output_dir: Path) -> Dict[str, object]:
     total = len(rows)
     actor_a_wins = sum(row["winner"] == "actor_a" for row in rows)
@@ -457,7 +485,10 @@ def build_summary(rows: List[Dict[str, object]], output_dir: Path) -> Dict[str, 
         "tie_rate": ties / total if total else 0.0,
         "actor_a_avg_reward": average(rows, "actor_a_reward"),
         "actor_b_avg_reward": average(rows, "actor_b_reward"),
+        "actor_a_reward_std": metric_std(rows, "actor_a_reward"),
+        "actor_b_reward_std": metric_std(rows, "actor_b_reward"),
         "avg_reward_margin": average(rows, "reward_margin"),
+        "reward_margin_std": metric_std(rows, "reward_margin"),
         "avg_steps": average(rows, "steps"),
         "avg_duration_sec": average(rows, "duration_sec"),
         "actor_a_crash_rate": sum(row["actor_a_status"] == "crash" for row in rows) / total if total else 0.0,
@@ -471,6 +502,38 @@ def build_summary(rows: List[Dict[str, object]], output_dir: Path) -> Dict[str, 
         "actor_a_missile_hit_rate": actor_a_hits / actor_a_launched if actor_a_launched else 0.0,
         "actor_b_missile_hit_rate": actor_b_hits / actor_b_launched if actor_b_launched else 0.0,
     }
+    if has_metric(rows, "final_distance_m"):
+        summary.update(
+            {
+                "final_distance_avg_m": metric_mean(rows, "final_distance_m"),
+                "final_distance_std_m": metric_std(rows, "final_distance_m"),
+                "final_distance_avg_km": metric_mean(rows, "final_distance_m") / 1000.0,
+                "final_distance_std_km": metric_std(rows, "final_distance_m") / 1000.0,
+            }
+        )
+
+    for prefix in ("actor_a", "actor_b"):
+        metric_prefix = f"{prefix}_final"
+        if has_metric(rows, f"{metric_prefix}_ao_deg"):
+            summary.update(
+                {
+                    f"{metric_prefix}_ao_avg_deg": metric_mean(rows, f"{metric_prefix}_ao_deg"),
+                    f"{metric_prefix}_ao_std_deg": metric_std(rows, f"{metric_prefix}_ao_deg"),
+                    f"{metric_prefix}_ta_avg_deg": metric_mean(rows, f"{metric_prefix}_ta_deg"),
+                    f"{metric_prefix}_ta_std_deg": metric_std(rows, f"{metric_prefix}_ta_deg"),
+                }
+            )
+
+        metric_prefix = f"{prefix}_episode_mean"
+        if has_metric(rows, f"{metric_prefix}_ao_deg"):
+            summary.update(
+                {
+                    f"{metric_prefix}_ao_avg_deg": metric_mean(rows, f"{metric_prefix}_ao_deg"),
+                    f"{metric_prefix}_ao_std_deg": metric_std(rows, f"{metric_prefix}_ao_deg"),
+                    f"{metric_prefix}_ta_avg_deg": metric_mean(rows, f"{metric_prefix}_ta_deg"),
+                    f"{metric_prefix}_ta_std_deg": metric_std(rows, f"{metric_prefix}_ta_deg"),
+                }
+            )
     return summary
 
 
@@ -495,6 +558,87 @@ def configure_plot_style() -> None:
 
 def numeric_series(rows: List[Dict[str, object]], key: str) -> np.ndarray:
     return np.asarray([float(row[key]) for row in rows], dtype=np.float64)
+
+
+def safe_numeric_series(rows: List[Dict[str, object]], key: str) -> Optional[np.ndarray]:
+    values = metric_values(rows, key)
+    if not values:
+        return None
+    return np.asarray(values, dtype=np.float64)
+
+
+def simulator_feature(sim) -> np.ndarray:
+    """提取计算相对态势所需的 3D 位置和速度。"""
+    return np.hstack([sim.get_position(), sim.get_velocity()])
+
+
+def relative_state_metrics(actor_a_sim, actor_b_sim) -> Dict[str, float]:
+    """计算双方相对距离、AO 和 TA；角度同时从两个 actor 视角记录。"""
+    actor_a_feature = simulator_feature(actor_a_sim)
+    actor_b_feature = simulator_feature(actor_b_sim)
+
+    actor_a_ao, actor_a_ta, distance_m = get_AO_TA_R(actor_a_feature, actor_b_feature)
+    actor_b_ao, actor_b_ta, _ = get_AO_TA_R(actor_b_feature, actor_a_feature)
+    return {
+        "distance_m": float(distance_m),
+        "actor_a_ao_deg": float(np.rad2deg(actor_a_ao)),
+        "actor_a_ta_deg": float(np.rad2deg(actor_a_ta)),
+        "actor_b_ao_deg": float(np.rad2deg(actor_b_ao)),
+        "actor_b_ta_deg": float(np.rad2deg(actor_b_ta)),
+    }
+
+
+def append_metric_history(history: Dict[str, List[float]], metrics: Dict[str, float]) -> None:
+    for key, value in metrics.items():
+        history.setdefault(key, []).append(value)
+
+
+def metric_history_mean(history: Dict[str, List[float]], key: str) -> float:
+    values = history.get(key, [])
+    return float(np.mean(values)) if values else 0.0
+
+
+def metric_history_std(history: Dict[str, List[float]], key: str) -> float:
+    values = history.get(key, [])
+    if len(values) <= 1:
+        return 0.0
+    return float(np.std(values, ddof=1))
+
+
+def summarize_relative_history(history: Dict[str, List[float]]) -> Dict[str, float]:
+    """汇总单局内的末态距离、末态 AO/TA 和整局平均 AO/TA。"""
+    if not history:
+        return {
+            "final_distance_m": 0.0,
+            "actor_a_final_ao_deg": 0.0,
+            "actor_a_final_ta_deg": 0.0,
+            "actor_b_final_ao_deg": 0.0,
+            "actor_b_final_ta_deg": 0.0,
+            "actor_a_episode_mean_ao_deg": 0.0,
+            "actor_a_episode_mean_ta_deg": 0.0,
+            "actor_b_episode_mean_ao_deg": 0.0,
+            "actor_b_episode_mean_ta_deg": 0.0,
+            "actor_a_episode_std_ao_deg": 0.0,
+            "actor_a_episode_std_ta_deg": 0.0,
+            "actor_b_episode_std_ao_deg": 0.0,
+            "actor_b_episode_std_ta_deg": 0.0,
+        }
+
+    return {
+        "final_distance_m": float(history["distance_m"][-1]),
+        "actor_a_final_ao_deg": float(history["actor_a_ao_deg"][-1]),
+        "actor_a_final_ta_deg": float(history["actor_a_ta_deg"][-1]),
+        "actor_b_final_ao_deg": float(history["actor_b_ao_deg"][-1]),
+        "actor_b_final_ta_deg": float(history["actor_b_ta_deg"][-1]),
+        "actor_a_episode_mean_ao_deg": metric_history_mean(history, "actor_a_ao_deg"),
+        "actor_a_episode_mean_ta_deg": metric_history_mean(history, "actor_a_ta_deg"),
+        "actor_b_episode_mean_ao_deg": metric_history_mean(history, "actor_b_ao_deg"),
+        "actor_b_episode_mean_ta_deg": metric_history_mean(history, "actor_b_ta_deg"),
+        "actor_a_episode_std_ao_deg": metric_history_std(history, "actor_a_ao_deg"),
+        "actor_a_episode_std_ta_deg": metric_history_std(history, "actor_a_ta_deg"),
+        "actor_b_episode_std_ao_deg": metric_history_std(history, "actor_b_ao_deg"),
+        "actor_b_episode_std_ta_deg": metric_history_std(history, "actor_b_ta_deg"),
+    }
 
 
 def moving_average(values: np.ndarray, window: int) -> Tuple[np.ndarray, np.ndarray]:
@@ -643,6 +787,43 @@ def plot_terminal_metrics(rows: List[Dict[str, object]], plot_dir: Path) -> Path
     return save_plot(fig, plot_dir, "terminal_metrics.png")
 
 
+def plot_tactical_metrics(rows: List[Dict[str, object]], plot_dir: Path) -> Optional[Path]:
+    if not has_metric(rows, "final_distance_m"):
+        return None
+
+    episode_ids = numeric_series(rows, "episode")
+    final_distance_km = numeric_series(rows, "final_distance_m") / 1000.0
+    actor_a_mean_ao = safe_numeric_series(rows, "actor_a_episode_mean_ao_deg")
+    actor_b_mean_ao = safe_numeric_series(rows, "actor_b_episode_mean_ao_deg")
+    actor_a_mean_ta = safe_numeric_series(rows, "actor_a_episode_mean_ta_deg")
+    actor_b_mean_ta = safe_numeric_series(rows, "actor_b_episode_mean_ta_deg")
+
+    fig, axes = plt.subplots(3, 1, figsize=(10, 10), sharex=True)
+    add_line_with_average(axes[0], episode_ids, final_distance_km, "最终距离", "#9467bd")
+    axes[0].set_title("最终距离曲线")
+    axes[0].set_ylabel("距离(km)")
+    axes[0].grid(True, alpha=0.3)
+    axes[0].legend()
+
+    if actor_a_mean_ao is not None and actor_b_mean_ao is not None:
+        add_line_with_average(axes[1], episode_ids[: actor_a_mean_ao.size], actor_a_mean_ao, "Actor A 平均 AO", "#1f77b4")
+        add_line_with_average(axes[1], episode_ids[: actor_b_mean_ao.size], actor_b_mean_ao, "Actor B 平均 AO", "#d62728")
+    axes[1].set_title("整局平均 AO 曲线")
+    axes[1].set_ylabel("AO(deg)")
+    axes[1].grid(True, alpha=0.3)
+    axes[1].legend()
+
+    if actor_a_mean_ta is not None and actor_b_mean_ta is not None:
+        add_line_with_average(axes[2], episode_ids[: actor_a_mean_ta.size], actor_a_mean_ta, "Actor A 平均 TA", "#1f77b4")
+        add_line_with_average(axes[2], episode_ids[: actor_b_mean_ta.size], actor_b_mean_ta, "Actor B 平均 TA", "#d62728")
+    axes[2].set_title("整局平均 TA 曲线")
+    axes[2].set_xlabel("Episode")
+    axes[2].set_ylabel("TA(deg)")
+    axes[2].grid(True, alpha=0.3)
+    axes[2].legend()
+    return save_plot(fig, plot_dir, "tactical_metrics.png")
+
+
 def plot_status_counts(rows: List[Dict[str, object]], plot_dir: Path) -> Path:
     statuses = ["alive", "crash", "shotdown", "unknown"]
     status_labels = ["存活", "坠毁", "被击落", "未知"]
@@ -721,6 +902,10 @@ def plot_results(rows: List[Dict[str, object]], output_dir: Path) -> List[Path]:
         plot_terminal_metrics(rows, plot_dir),
         plot_status_counts(rows, plot_dir),
     ]
+    tactical_plot = plot_tactical_metrics(rows, plot_dir)
+    if tactical_plot is not None:
+        plot_paths.append(tactical_plot)
+
     missile_plot = plot_missile_stats(rows, plot_dir)
     if missile_plot is not None:
         plot_paths.append(missile_plot)
@@ -764,6 +949,7 @@ def run_episode(
     }
 
     actor_rewards = {"actor_a": 0.0, "actor_b": 0.0}
+    relative_history: Dict[str, List[float]] = {}
     acmi_path = None
     if SAVE_ACMI and episode in ACMI_EPISODES:
         acmi_path = output_dir / "acmi" / f"episode_{episode:04d}.txt.acmi"
@@ -777,6 +963,13 @@ def run_episode(
         for controller in slot_controllers:
             slot = actor_to_slot[controller.name]
             actor_rewards[controller.name] += float(rewards[slot, 0])
+
+        actor_a_sim = env.agents[actor_to_agent_id["actor_a"]]
+        actor_b_sim = env.agents[actor_to_agent_id["actor_b"]]
+        append_metric_history(
+            relative_history,
+            relative_state_metrics(actor_a_sim, actor_b_sim),
+        )
 
         if acmi_path is not None:
             env.render(mode="txt", filepath=str(acmi_path))
@@ -800,6 +993,7 @@ def run_episode(
 
     actor_a_missiles = missile_stats(env, actor_a_agent_id)
     actor_b_missiles = missile_stats(env, actor_b_agent_id)
+    relative_summary = summarize_relative_history(relative_history)
 
     row = {
         "episode": episode,
@@ -811,6 +1005,7 @@ def run_episode(
         "actor_a_reward": actor_rewards["actor_a"],
         "actor_b_reward": actor_rewards["actor_b"],
         "reward_margin": actor_rewards["actor_a"] - actor_rewards["actor_b"],
+        **relative_summary,
         "actor_a_bloods": float(actor_a_sim.bloods),
         "actor_b_bloods": float(actor_b_sim.bloods),
         "actor_a_status": actor_a_status,
@@ -826,7 +1021,7 @@ def run_episode(
     print(
         f"[{episode + 1}/{NUM_EPISODES}] winner={winner} "
         f"A_reward={row['actor_a_reward']:.2f} B_reward={row['actor_b_reward']:.2f} "
-        f"steps={row['steps']}"
+        f"final_dist={row['final_distance_m'] / 1000.0:.2f}km steps={row['steps']}"
     )
     return row
 
