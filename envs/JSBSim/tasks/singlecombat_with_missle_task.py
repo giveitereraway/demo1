@@ -281,7 +281,7 @@ class TacticalHierarchicalSingleCombatShootTask(TacticalHierarchicalSingleCombat
 
     def load_action_space(self):
         # 战术机动动作 + 导弹发射动作。
-        self.action_space = spaces.Tuple([spaces.Discrete(6), spaces.Discrete(2)])
+        self.action_space = spaces.Tuple([spaces.Discrete(12), spaces.Discrete(2)])
 
     def get_obs(self, env, agent_id):
         return SingleCombatShootMissileTask.get_obs(self, env, agent_id)

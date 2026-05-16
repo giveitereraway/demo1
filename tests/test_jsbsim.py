@@ -155,9 +155,9 @@ class TestSingleCombatEnv:
         assert isinstance(env.action_space, gym.spaces.Tuple if is_shoot else gym.spaces.Discrete)
         if is_shoot:
             assert isinstance(env.action_space[0], gym.spaces.Discrete)
-            assert env.action_space[0].n == 6 and env.action_space[1].n == 2
+            assert env.action_space[0].n == 12 and env.action_space[1].n == 2
         else:
-            assert env.action_space.n == 6
+            assert env.action_space.n == 12
 
         obs_shape = (env.num_agents, *env.observation_space.shape)
         reward_shape = (env.num_agents, 1)

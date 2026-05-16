@@ -293,34 +293,97 @@ class HierarchicalSingleCombatTask(SingleCombatTask):
 
 
 class TacticalHierarchicalSingleCombatTask(HierarchicalSingleCombatTask):
-    PURSUE = 0
-    DISENGAGE = 1
-    CLIMB = 2
-    DIVE = 3
-    TURN_LEFT = 4
-    TURN_RIGHT = 5
+    PURE_PURSUIT = 0
+    LEAD_PURSUIT = 1
+    LAG_PURSUIT = 2
+    DISENGAGE = 3
+    CLIMB_POSITION = 4
+    DIVE_ACCELERATE = 5
+    LEVEL_ACCELERATE = 6
+    LEVEL_DECELERATE = 7
+    DEFENSIVE_TURN_LEFT = 8
+    DEFENSIVE_TURN_RIGHT = 9
+    HIGH_YOYO = 10
+    LOW_YOYO = 11
 
     def load_action_space(self):
-        self.action_space = spaces.Discrete(6)
+        self.action_space = spaces.Discrete(12)
 
-    def _heading_error_to_vector(self, env, agent_id, target_xy):
+    def _safe_unit_vector(self, vector, fallback=None):
+        vector = np.asarray(vector, dtype=np.float32)
+        norm = np.linalg.norm(vector)
+        if norm > 1e-6:
+            return vector / norm
+        if fallback is None:
+            return np.zeros_like(vector, dtype=np.float32)
+        fallback = np.asarray(fallback, dtype=np.float32)
+        fallback_norm = np.linalg.norm(fallback)
+        if fallback_norm > 1e-6:
+            return fallback / fallback_norm
+        return np.zeros_like(vector, dtype=np.float32)
+
+    def _ego_heading_vector(self, env, agent_id):
         ego = env.agents[agent_id]
         ego_xy = np.asarray(ego.get_velocity()[:2], dtype=np.float32)
+        if np.linalg.norm(ego_xy) > 1e-6:
+            return self._safe_unit_vector(ego_xy)
+
+        # 低速或速度向量异常时，回退到 JSBSim 当前航向，避免战术动作方向抖动。
+        heading = ego.get_property_value(c.attitude_heading_true_rad)
+        return np.array([np.cos(heading), np.sin(heading)], dtype=np.float32)
+
+    def _rotate_vector(self, vector, angle):
+        cos_angle = np.cos(angle)
+        sin_angle = np.sin(angle)
+        return np.array([
+            vector[0] * cos_angle - vector[1] * sin_angle,
+            vector[0] * sin_angle + vector[1] * cos_angle,
+        ], dtype=np.float32)
+
+    def _combat_geometry(self, env, agent_id):
+        ego = env.agents[agent_id]
+        enm = ego.enemies[0]
+        ego_pos = np.asarray(ego.get_position(), dtype=np.float32)
+        enm_pos = np.asarray(enm.get_position(), dtype=np.float32)
+        ego_vel = np.asarray(ego.get_velocity(), dtype=np.float32)
+        enm_vel = np.asarray(enm.get_velocity(), dtype=np.float32)
+
+        relative = enm_pos - ego_pos
+        relative_xy = relative[:2]
+        distance_xy = np.linalg.norm(relative_xy)
+        if distance_xy < 1e-6:
+            relative_xy = self._ego_heading_vector(env, agent_id)
+            distance_xy = 0.0
+
+        return {
+            "ego": ego,
+            "enm": enm,
+            "ego_vel_xy": ego_vel[:2],
+            "enm_vel_xy": enm_vel[:2],
+            "relative_xy": relative_xy.astype(np.float32),
+            "distance_xy": float(distance_xy),
+            "ego_heading_xy": self._ego_heading_vector(env, agent_id),
+            "enm_heading_xy": self._safe_unit_vector(enm_vel[:2], fallback=relative_xy),
+        }
+
+    def _heading_error_to_vector(self, env, agent_id, target_xy):
         target_xy = np.asarray(target_xy, dtype=np.float32)
 
-        if np.linalg.norm(ego_xy) < 1e-6:
-            heading = ego.get_property_value(c.attitude_heading_true_rad)
-            ego_xy = np.array([np.cos(heading), np.sin(heading)], dtype=np.float32)
         if np.linalg.norm(target_xy) < 1e-6:
             return 0.0
 
-        ego_xy = ego_xy / (np.linalg.norm(ego_xy) + 1e-8)
-        target_xy = target_xy / (np.linalg.norm(target_xy) + 1e-8)
+        ego_xy = self._ego_heading_vector(env, agent_id)
+        target_xy = self._safe_unit_vector(target_xy, fallback=ego_xy)
         dot = np.clip(np.dot(ego_xy, target_xy), -1.0, 1.0)
         # 二维向量叉积只需要 z 分量，用来判断目标在当前速度方向的左/右侧。
         cross_z = ego_xy[0] * target_xy[1] - ego_xy[1] * target_xy[0]
         heading_error = np.arctan2(cross_z, dot)
         return np.clip(heading_error, -np.pi / 6, np.pi / 6)
+
+    def _quantize_heading_error(self, heading_error):
+        # 航向指令量化回原分层任务的 5 个档位，减少低层控制器的输入分布偏移。
+        index = np.argmin(np.abs(self.norm_delta_heading - heading_error))
+        return float(self.norm_delta_heading[index])
 
     def _altitude_step_to_enemy(self, env, agent_id):
         ego = env.agents[agent_id]
@@ -332,40 +395,106 @@ class TacticalHierarchicalSingleCombatTask(HierarchicalSingleCombatTask):
             return -0.1
         return 0.0
 
-    def _tactical_action_to_delta_control(self, env, agent_id, action_id):
-        ego = env.agents[agent_id]
-        enm = ego.enemies[0]
-        relative_xy = np.asarray((enm.get_position() - ego.get_position())[:2], dtype=np.float32)
-        if np.linalg.norm(relative_xy) < 1e-6:
-            relative_xy = np.asarray(ego.get_velocity()[:2], dtype=np.float32)
+    def _lead_target_vector(self, geometry):
+        # 提前量追击：按敌机短时速度外推目标点，鼓励抢占敌机前方。
+        ego_speed = np.linalg.norm(geometry["ego_vel_xy"])
+        lead_time = np.clip(geometry["distance_xy"] / (ego_speed + 1e-6), 1.0, 3.0)
+        return geometry["relative_xy"] + geometry["enm_vel_xy"] * lead_time
 
-        target_xy = relative_xy
+    def _lag_target_vector(self, geometry):
+        # 滞后追击：瞄准敌机后方一点，减少过冲并更容易进入尾随位置。
+        lag_distance = np.clip(geometry["distance_xy"] * 0.35, 300.0, 900.0)
+        return geometry["relative_xy"] - geometry["enm_heading_xy"] * lag_distance
+
+    def _blend_with_enemy_vector(self, geometry, enemy_weight=0.7):
+        enemy_vector = self._safe_unit_vector(geometry["relative_xy"], fallback=geometry["ego_heading_xy"])
+        ego_vector = geometry["ego_heading_xy"]
+        return enemy_vector * enemy_weight + ego_vector * (1.0 - enemy_weight)
+
+    def _apply_tactical_safety(self, env, agent_id, action_id, delta_altitude, delta_velocity, distance_xy):
+        ego = env.agents[agent_id]
+        altitude = ego.get_property_value(c.position_h_sl_m)
+        altitude_limit = getattr(self.config, "altitude_limit", 2500)
+
+        # 接近低高度终止线时禁止继续俯冲，极低时主动给爬升指令。
+        if delta_altitude < 0.0 and altitude <= altitude_limit + 1000:
+            delta_altitude = 0.1 if altitude <= altitude_limit + 500 else 0.0
+
+        # 距离过近时，追击类动作不再强制加速，避免贴近后姿态奖励恶化。
+        close_distance = min(getattr(self.config, "PostureReward_target_dist", 3.0) * 1000 * 0.35, 1200.0)
+        if action_id in (self.PURE_PURSUIT, self.LEAD_PURSUIT) and distance_xy < close_distance:
+            delta_velocity = 0.0
+
+        return delta_altitude, delta_velocity
+
+    def _tactical_action_to_delta_control(self, env, agent_id, action_id):
+        geometry = self._combat_geometry(env, agent_id)
+        relative_xy = geometry["relative_xy"]
+        ego_heading_xy = geometry["ego_heading_xy"]
+        distance_xy = geometry["distance_xy"]
+
         delta_altitude = 0.0
         delta_velocity = 0.0
 
-        if action_id == self.PURSUE:
+        if action_id == self.PURE_PURSUIT:
+            # 纯追击：直接指向敌机当前位置。
             target_xy = relative_xy
             delta_altitude = self._altitude_step_to_enemy(env, agent_id)
             delta_velocity = 0.05
+        elif action_id == self.LEAD_PURSUIT:
+            # 提前量追击：瞄准敌机短时预测位置。
+            target_xy = self._lead_target_vector(geometry)
+            delta_altitude = self._altitude_step_to_enemy(env, agent_id)
+            delta_velocity = 0.05 if distance_xy > 2000.0 else 0.0
+        elif action_id == self.LAG_PURSUIT:
+            # 滞后追击：瞄准敌机后方，适合距离较近时尾随占位。
+            target_xy = self._lag_target_vector(geometry)
+            delta_altitude = self._altitude_step_to_enemy(env, agent_id)
+            delta_velocity = -0.05 if distance_xy < 1500.0 else 0.0
         elif action_id == self.DISENGAGE:
+            # 脱离：背离敌机并加速拉开空间。
             target_xy = -relative_xy
             delta_velocity = 0.05
-        elif action_id == self.CLIMB:
+        elif action_id == self.CLIMB_POSITION:
+            # 爬升占位：向敌机方向保持压力，同时换取高度优势。
             target_xy = relative_xy
             delta_altitude = 0.1
-            delta_velocity = -0.05
-        elif action_id == self.DIVE:
+        elif action_id == self.DIVE_ACCELERATE:
+            # 俯冲加速：向敌机方向压低高度并恢复能量。
             target_xy = relative_xy
             delta_altitude = -0.1
             delta_velocity = 0.05
-        elif action_id == self.TURN_LEFT:
-            target_xy = np.array([-relative_xy[1], relative_xy[0]], dtype=np.float32)
-        elif action_id == self.TURN_RIGHT:
-            target_xy = np.array([relative_xy[1], -relative_xy[0]], dtype=np.float32)
+        elif action_id == self.LEVEL_ACCELERATE:
+            # 平飞加速：保持当前航向恢复速度。
+            target_xy = ego_heading_xy
+            delta_velocity = 0.05
+        elif action_id == self.LEVEL_DECELERATE:
+            # 平飞减速：保持当前航向并降低速度，缓解近距离过冲。
+            target_xy = ego_heading_xy
+            delta_velocity = -0.05
+        elif action_id == self.DEFENSIVE_TURN_LEFT:
+            # 左防御转弯：基于本机当前航向左转，而不是围绕敌机相对位置旋转。
+            target_xy = self._rotate_vector(ego_heading_xy, np.pi / 2)
+        elif action_id == self.DEFENSIVE_TURN_RIGHT:
+            # 右防御转弯：基于本机当前航向右转。
+            target_xy = self._rotate_vector(ego_heading_xy, -np.pi / 2)
+        elif action_id == self.HIGH_YOYO:
+            # 高悠悠：朝敌机方向偏转、爬升、减速，换取高度和角度优势。
+            target_xy = self._blend_with_enemy_vector(geometry, enemy_weight=0.7)
+            delta_altitude = 0.1
+            delta_velocity = -0.05
+        elif action_id == self.LOW_YOYO:
+            # 低悠悠：朝敌机方向偏转、俯冲、加速，先换速度再转入进攻。
+            target_xy = self._blend_with_enemy_vector(geometry, enemy_weight=0.7)
+            delta_altitude = -0.1
+            delta_velocity = 0.05
         else:
             raise ValueError(f"Unknown tactical action id: {action_id}")
 
-        delta_heading = self._heading_error_to_vector(env, agent_id, target_xy)
+        delta_altitude, delta_velocity = self._apply_tactical_safety(
+            env, agent_id, action_id, delta_altitude, delta_velocity, distance_xy
+        )
+        delta_heading = self._quantize_heading_error(self._heading_error_to_vector(env, agent_id, target_xy))
         return np.array([delta_altitude, delta_heading, delta_velocity], dtype=np.float32)
 
     def normalize_action(self, env, agent_id, action):
