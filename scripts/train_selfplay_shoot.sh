@@ -1,9 +1,9 @@
 #!/bin/sh
 
 env="SingleCombat"
-scenario="1v1/ShootMissile/Selfplay"
+scenario="1v1/ShootMissile/HierarchySelfplay"
 algo="ppo"
-exp="1v1_shoot_selfplay"
+exp="1v1_shoot_hierarchy"
 seed=1
 export WANDB_MODE="offline"
 

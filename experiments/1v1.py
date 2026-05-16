@@ -30,6 +30,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from algorithms.ppo.ppo_actor import PPOActor
+from envs.JSBSim.core.catalog import Catalog as c
 from envs.JSBSim.envs import SingleCombatEnv
 from envs.JSBSim.utils.utils import get_AO_TA_R
 
@@ -38,7 +39,7 @@ from envs.JSBSim.utils.utils import get_AO_TA_R
 # 可修改实验配置
 # =========================
 
-EXPERIMENT_NAME = "selfA_vs_hierarchyself_3B"
+EXPERIMENT_NAME = "selfA_vs_tacticalhierarchyselfB"
 
 # 评估环境必须使用直接控制版 SingleCombat 场景。
 EVAL_SCENARIO_NAME = "1v1/NoWeapon/Selfplay"
@@ -47,8 +48,8 @@ EVAL_SCENARIO_NAME = "1v1/NoWeapon/Selfplay"
 ACTOR_A_PATH = REPO_ROOT / "scripts/results/SingleCombat/1v1/NoWeapon/Selfplay/ppo/1v1_follow/wandb/offline-run-20260512_175151-yryla8wg/files/actor_latest.pt"
 ACTOR_A_SCENARIO_NAME = "1v1/NoWeapon/Selfplay"
 
-ACTOR_B_PATH = REPO_ROOT / "scripts/results/SingleCombat/1v1/NoWeapon/HierarchySelfplay/ppo/1v1_follow_hierarchy_3/wandb/offline-run-20260513_112510-k33hp7hh/files/actor_latest.pt"
-ACTOR_B_SCENARIO_NAME = "1v1/NoWeapon/HierarchySelfplay"
+ACTOR_B_PATH = REPO_ROOT / "scripts/results/SingleCombat/1v1/NoWeapon/TacticalHierarchySelfplay/ppo/1v1_tactical_hierarchy/wandb/latest-run/files/actor_latest.pt"
+ACTOR_B_SCENARIO_NAME = "1v1/NoWeapon/TacticalHierarchySelfplay"
 
 # 分层 actor 的低层控制器。
 LOWLEVEL_ACTOR_PATH = REPO_ROOT / "envs/JSBSim/model/actor_heading.pt"
@@ -90,10 +91,13 @@ SUPPRESS_POLICY_DEBUG_PRINT = True
 TASK_FAMILY = {
     "singlecombat": "NoWeapon",
     "hierarchical_singlecombat": "NoWeapon",
+    "tactical_hierarchical_singlecombat": "NoWeapon",
     "singlecombat_dodge_missile": "DodgeMissile",
     "hierarchical_singlecombat_dodge_missile": "DodgeMissile",
+    "tactical_hierarchical_singlecombat_dodge_missile": "DodgeMissile",
     "singlecombat_shoot": "ShootMissile",
     "hierarchical_singlecombat_shoot": "ShootMissile",
+    "tactical_hierarchical_singlecombat_shoot": "ShootMissile",
 }
 
 DIRECT_EVAL_TASKS = {
@@ -136,10 +140,12 @@ def task_family(task_name: str) -> str:
 
 def action_dim(action_space) -> int:
     """统计 actor 输出动作维度，用于基础兼容性检查。"""
+    if isinstance(action_space, spaces.Discrete):
+        return 1
     if isinstance(action_space, spaces.MultiDiscrete):
         return int(action_space.shape[0])
     if isinstance(action_space, spaces.Tuple):
-        return int(action_space[0].shape[0] + 1)
+        return int(sum(action_dim(space) for space in action_space.spaces))
     raise TypeError(f"不支持的动作空间: {action_space}")
 
 
@@ -151,6 +157,7 @@ class ActorController:
     task_name: str
     family: str
     is_hierarchical: bool
+    is_tactical: bool
     is_shoot: bool
     obs_dim: int
     actor_action_dim: int
@@ -165,7 +172,7 @@ class ActorController:
         self.masks = np.ones((1, 1), dtype=np.float32)
 
     @torch.no_grad()
-    def act(self, obs: np.ndarray) -> np.ndarray:
+    def act(self, obs: np.ndarray, env: Optional[SingleCombatEnv] = None, agent_id: Optional[str] = None) -> np.ndarray:
         obs_batch = np.expand_dims(obs, axis=0)
         if SUPPRESS_POLICY_DEBUG_PRINT:
             stream = io.StringIO()
@@ -184,13 +191,18 @@ class ActorController:
                 deterministic=DETERMINISTIC,
             )
 
-        raw_action = _t2n(actor_action).squeeze(0)
+        raw_action = np.asarray(_t2n(actor_action).squeeze(0)).reshape(-1)
         self.rnn_states = _t2n(self.rnn_states)
 
         if not self.is_hierarchical:
             return raw_action
 
-        lowlevel_action = self._hierarchical_to_lowlevel(obs, raw_action)
+        if self.is_tactical:
+            if env is None or agent_id is None:
+                raise ValueError(f"{self.name} 是 tactical_hierarchical actor，act() 需要 env 和 agent_id。")
+            lowlevel_action = self._tactical_to_lowlevel(obs, raw_action, env, agent_id)
+        else:
+            lowlevel_action = self._hierarchical_to_lowlevel(obs, raw_action)
         if self.is_shoot:
             return np.concatenate([lowlevel_action, raw_action[-1:]], axis=0)
         return lowlevel_action
@@ -209,10 +221,19 @@ class ActorController:
 
         # 分层高层动作含义：高度变化、航向变化、速度变化。
         high_action = high_action.astype(np.int64)
+        delta_control = np.array(
+            [
+                delta_altitude[high_action[0]],
+                delta_heading[high_action[1]],
+                delta_velocity[high_action[2]],
+            ],
+            dtype=np.float32,
+        )
+        return self._delta_control_to_lowlevel(obs, delta_control)
+
+    def _delta_control_to_lowlevel(self, obs: np.ndarray, delta_control: np.ndarray) -> np.ndarray:
         lowlevel_obs = np.zeros(12, dtype=np.float32)
-        lowlevel_obs[0] = delta_altitude[high_action[0]]
-        lowlevel_obs[1] = delta_heading[high_action[1]]
-        lowlevel_obs[2] = delta_velocity[high_action[2]]
+        lowlevel_obs[0:3] = np.asarray(delta_control, dtype=np.float32)
         lowlevel_obs[3:12] = obs[:9]
 
         lowlevel_action, _, self.lowlevel_rnn_states = self.lowlevel_policy(
@@ -223,6 +244,87 @@ class ActorController:
         )
         self.lowlevel_rnn_states = _t2n(self.lowlevel_rnn_states)
         return _t2n(lowlevel_action).squeeze(0)
+
+    def _heading_error_to_vector(self, env: SingleCombatEnv, agent_id: str, target_xy: np.ndarray) -> float:
+        ego = env.agents[agent_id]
+        ego_xy = np.asarray(ego.get_velocity()[:2], dtype=np.float32)
+        target_xy = np.asarray(target_xy, dtype=np.float32)
+
+        if np.linalg.norm(ego_xy) < 1e-6:
+            heading = ego.get_property_value(c.attitude_heading_true_rad)
+            ego_xy = np.array([np.cos(heading), np.sin(heading)], dtype=np.float32)
+        if np.linalg.norm(target_xy) < 1e-6:
+            return 0.0
+
+        ego_xy = ego_xy / (np.linalg.norm(ego_xy) + 1e-8)
+        target_xy = target_xy / (np.linalg.norm(target_xy) + 1e-8)
+        dot = np.clip(np.dot(ego_xy, target_xy), -1.0, 1.0)
+        cross_z = ego_xy[0] * target_xy[1] - ego_xy[1] * target_xy[0]
+        heading_error = np.arctan2(cross_z, dot)
+        return float(np.clip(heading_error, -np.pi / 6, np.pi / 6))
+
+    def _altitude_step_to_enemy(self, env: SingleCombatEnv, agent_id: str) -> float:
+        ego = env.agents[agent_id]
+        enm = ego.enemies[0]
+        delta_altitude = float(enm.get_position()[2] - ego.get_position()[2])
+        if delta_altitude > 250:
+            return 0.1
+        if delta_altitude < -250:
+            return -0.1
+        return 0.0
+
+    def _tactical_action_to_delta_control(
+        self,
+        env: SingleCombatEnv,
+        agent_id: str,
+        action_id: int,
+    ) -> np.ndarray:
+        ego = env.agents[agent_id]
+        enm = ego.enemies[0]
+        relative_xy = np.asarray((enm.get_position() - ego.get_position())[:2], dtype=np.float32)
+        if np.linalg.norm(relative_xy) < 1e-6:
+            relative_xy = np.asarray(ego.get_velocity()[:2], dtype=np.float32)
+
+        target_xy = relative_xy
+        delta_altitude = 0.0
+        delta_velocity = 0.0
+
+        # 与 TacticalHierarchicalSingleCombatTask 保持一致的 6 个战术动作编号。
+        if action_id == 0:  # 追击
+            target_xy = relative_xy
+            delta_altitude = self._altitude_step_to_enemy(env, agent_id)
+            delta_velocity = 0.05
+        elif action_id == 1:  # 脱离
+            target_xy = -relative_xy
+            delta_velocity = 0.05
+        elif action_id == 2:  # 爬升
+            target_xy = relative_xy
+            delta_altitude = 0.1
+            delta_velocity = -0.05
+        elif action_id == 3:  # 俯冲
+            target_xy = relative_xy
+            delta_altitude = -0.1
+            delta_velocity = 0.05
+        elif action_id == 4:  # 左转
+            target_xy = np.array([-relative_xy[1], relative_xy[0]], dtype=np.float32)
+        elif action_id == 5:  # 右转
+            target_xy = np.array([relative_xy[1], -relative_xy[0]], dtype=np.float32)
+        else:
+            raise ValueError(f"未知 tactical action id: {action_id}")
+
+        delta_heading = self._heading_error_to_vector(env, agent_id, target_xy)
+        return np.array([delta_altitude, delta_heading, delta_velocity], dtype=np.float32)
+
+    def _tactical_to_lowlevel(
+        self,
+        obs: np.ndarray,
+        raw_action: np.ndarray,
+        env: SingleCombatEnv,
+        agent_id: str,
+    ) -> np.ndarray:
+        action_id = int(np.asarray(raw_action).reshape(-1)[0])
+        delta_control = self._tactical_action_to_delta_control(env, agent_id, action_id)
+        return self._delta_control_to_lowlevel(obs, delta_control)
 
 
 def load_lowlevel_policy(device: torch.device) -> PPOActor:
@@ -265,13 +367,15 @@ def load_controller(
     finally:
         actor_env.close()
 
+    is_tactical = task_name.startswith("tactical_hierarchical_")
     controller = ActorController(
         name=name,
         path=actor_path,
         scenario_name=scenario_name,
         task_name=task_name,
         family=family,
-        is_hierarchical=task_name.startswith("hierarchical_"),
+        is_hierarchical=task_name.startswith("hierarchical_") or is_tactical,
+        is_tactical=is_tactical,
         is_shoot="shoot" in task_name,
         obs_dim=obs_dim,
         actor_action_dim=actor_action_dim,
@@ -957,7 +1061,10 @@ def run_episode(
         env.render(mode="txt", filepath=str(acmi_path))
 
     while True:
-        actions = [controller.act(obs[idx]) for idx, controller in enumerate(slot_controllers)]
+        actions = [
+            controller.act(obs[idx], env=env, agent_id=actor_to_agent_id[controller.name])
+            for idx, controller in enumerate(slot_controllers)
+        ]
         obs, rewards, dones, info = env.step(np.stack(actions, axis=0))
 
         for controller in slot_controllers:
