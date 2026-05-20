@@ -1,4 +1,7 @@
 #!/usr/bin/env python
+from __future__ import annotations
+
+import argparse
 import csv
 import io
 import json
@@ -10,9 +13,28 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, Iterable, List, Optional, Tuple
 
-import numpy as np
-import torch
-from gymnasium import spaces
+HELP_REQUESTED = any(arg in {"-h", "--help"} for arg in sys.argv[1:])
+RUNTIME_IMPORT_ERROR = None
+
+try:
+    import numpy as np
+    import torch
+    from gymnasium import spaces
+except Exception as exc:
+    if not HELP_REQUESTED:
+        raise
+    RUNTIME_IMPORT_ERROR = exc
+    np = None
+    spaces = None
+
+    class _TorchHelpStub:
+        def no_grad(self):
+            def decorator(func):
+                return func
+
+            return decorator
+
+    torch = _TorchHelpStub()
 
 # matplotlib 只用于实验后处理，缺失时不影响对战评估。
 try:
@@ -29,32 +51,42 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from algorithms.ppo.ppo_actor import PPOActor
-from envs.JSBSim.core.catalog import Catalog as c
-from envs.JSBSim.envs import SingleCombatEnv
-from envs.JSBSim.utils.utils import get_AO_TA_R
+try:
+    from algorithms.ppo.ppo_actor import PPOActor
+    from envs.JSBSim.core.catalog import Catalog as c
+    from envs.JSBSim.envs import SingleCombatEnv
+    from envs.JSBSim.utils.utils import NEU2LLA, get_AO_TA_R
+except Exception as exc:
+    if not HELP_REQUESTED:
+        raise
+    RUNTIME_IMPORT_ERROR = RUNTIME_IMPORT_ERROR or exc
+    PPOActor = None
+    c = None
+    SingleCombatEnv = None
+    NEU2LLA = None
+    get_AO_TA_R = None
 
 
 # =========================
 # 可修改实验配置
 # =========================
 
-EXPERIMENT_NAME = "selfA_vs_tacticalhierarchyselfB"
+EXPERIMENT_NAME = "tacticalshoot_A_vs_hierarchyshootselfB"
 
 # 评估环境必须使用直接控制版 SingleCombat 场景。
-EVAL_SCENARIO_NAME = "1v1/NoWeapon/Selfplay"
+EVAL_SCENARIO_NAME = "1v1/ShootMissile/Selfplay"
 
 # 两个 actor 可以来自不同训练场景；脚本会按各自场景构造网络动作空间。
-ACTOR_A_PATH = REPO_ROOT / "scripts/results/SingleCombat/1v1/NoWeapon/Selfplay/ppo/1v1_follow/wandb/offline-run-20260512_175151-yryla8wg/files/actor_latest.pt"
-ACTOR_A_SCENARIO_NAME = "1v1/NoWeapon/Selfplay"
+ACTOR_A_PATH = REPO_ROOT / "scripts/results/SingleCombat/1v1/ShootMissile/TacticalHierarchySelfplay/ppo/1v1_tactical_hierarchy_shoot/wandb/run-20260518_181854-v6y70b6o/files/actor_latest.pt"
+ACTOR_A_SCENARIO_NAME = "1v1/ShootMissile/TacticalHierarchySelfplay"
 
-ACTOR_B_PATH = REPO_ROOT / "scripts/results/SingleCombat/1v1/NoWeapon/TacticalHierarchySelfplay/ppo/1v1_tactical_hierarchy/wandb/latest-run/files/actor_latest.pt"
-ACTOR_B_SCENARIO_NAME = "1v1/NoWeapon/TacticalHierarchySelfplay"
+ACTOR_B_PATH = REPO_ROOT / "scripts/results/SingleCombat/1v1/ShootMissile/HierarchySelfplay/ppo/1v1_shoot_hierarchy/wandb/offline-run-20260515_160545-s6vfbap6/files/actor_latest.pt"
+ACTOR_B_SCENARIO_NAME = "1v1/ShootMissile/HierarchySelfplay"
 
 # 分层 actor 的低层控制器。
 LOWLEVEL_ACTOR_PATH = REPO_ROOT / "envs/JSBSim/model/actor_heading.pt"
 
-NUM_EPISODES = 50
+NUM_EPISODES = 100
 SEED = 1
 DEVICE = "cuda:0"  # auto / cpu / cuda:0
 DETERMINISTIC = True
@@ -73,19 +105,173 @@ CUSTOM_INITIAL_STATES = None
 #     "B0100": {"ic_h_sl_ft": 20000, "ic_psi_true_deg": 180.0, "ic_u_fps": 800.0},
 # }
 
+# 初始状态模式：
+# fixed：沿用 YAML 的两个初始状态，只可选择是否随机换边。
+# random：每个 episode 重新采样双方距离、方位、高度、航向和速度。
+INITIAL_STATE_MODE = "random"  # fixed / random
+
+# 随机初始态范围。单位保持 JSBSim 初始条件习惯：高度 ft、速度 ft/s、角度 deg、距离 m。
+RANDOM_INITIAL_STATE_CONFIG = {
+    "distance_m": [18000.0, 22000.0], # 初始距离
+    "center_north_m": [-1500.0, 1500.0], # 两机连线中心点相对战场中心的北向偏移
+    "center_east_m": [-1500.0, 1500.0], # 两机连线中心点相对战场中心的东向偏移
+    "altitude_ft": [16000.0, 26000.0], # 两机平均初始高度
+    "altitude_difference_ft": [-3000.0, 3000.0], # 两机高度差
+    "speed_fps": [650.0, 950.0], # 双方初始速度范围
+    # mixed 会在迎头、同向追逐、交叉、随机航向中随机选一种。
+    "heading_mode": "head_on",  # mixed / head_on / tail_chase / crossing / random
+    "heading_noise_deg": 20.0, # 航向扰动角度
+}
+
 SAVE_ACMI = True
 ACMI_EPISODES = {0}  # 只保存指定回合，避免大量轨迹文件。
 OUTPUT_ROOT = REPO_ROOT / "experiments/results"
+OUTPUT_DIR = None
 
 # 是否在实验结束后保存图表，默认输出到结果目录下的 plots/。
 SAVE_PLOTS = True
 PLOT_DPI = 180
 MOVING_AVERAGE_WINDOW = 5
+
+# 绘图颜色约定：Actor A 固定红色，Actor B 固定蓝色，方便不同实验图表横向比较。
+ACTOR_A_COLOR = "#d62728"
+ACTOR_B_COLOR = "#1f77b4"
+TIE_COLOR = "#7f7f7f"
+
 PLOT_ONLY_RESULT_DIR = None
 #PLOT_ONLY_RESULT_DIR = OUTPUT_ROOT / "selfA_vs_hierarchyselfB_20260513_104605"
 
 # 当前 BetaShootBernoulli 内部有调试 print，射击任务中建议保持开启。
 SUPPRESS_POLICY_DEBUG_PRINT = True
+
+
+def str_to_bool(value) -> bool:
+    """把命令行里的 true/false 字符串转成 bool。"""
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"无法解析布尔值: {value}")
+
+
+def cli_path(value: str | Path | None) -> Optional[Path]:
+    if value is None:
+        return None
+    text = str(value).strip().strip('"').strip("'")
+    if sys.platform == "win32":
+        text = text.replace("/", "\\")
+    if text == "":
+        return None
+    path = Path(text).expanduser()
+    if not path.is_absolute():
+        path = REPO_ROOT / path
+    return path.resolve()
+
+
+def parse_acmi_episodes(value: str | Iterable[int]) -> set[int]:
+    """解析 0,1,2 形式的 ACMI 保存回合。"""
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped or stripped.lower() in {"none", "false", "no"}:
+            return set()
+        return {int(part.strip()) for part in stripped.split(",") if part.strip()}
+    return {int(item) for item in value}
+
+
+def parse_custom_initial_states(value: str | None):
+    """支持从 JSON 字符串或 JSON 文件读取初始状态覆盖。"""
+    if value is None or not str(value).strip():
+        return None
+    candidate = cli_path(value)
+    if candidate is not None and candidate.exists():
+        return json.loads(candidate.read_text(encoding="utf-8"))
+    return json.loads(str(value))
+
+
+def parse_random_initial_state_config(value: str | None) -> Dict[str, object]:
+    """读取随机初始态配置，允许用 JSON 字符串或 JSON 文件覆盖默认范围。"""
+    config = dict(RANDOM_INITIAL_STATE_CONFIG)
+    if value is None or not str(value).strip():
+        return config
+    candidate = cli_path(value)
+    if candidate is not None and candidate.exists():
+        override = json.loads(candidate.read_text(encoding="utf-8"))
+    else:
+        override = json.loads(str(value))
+    config.update(override)
+    return config
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="1v1 actor 对战评估脚本。")
+    parser.add_argument("--experiment-name", default=EXPERIMENT_NAME)
+    parser.add_argument("--eval-scenario-name", default=EVAL_SCENARIO_NAME)
+    parser.add_argument("--actor-a-path", default=str(ACTOR_A_PATH))
+    parser.add_argument("--actor-a-scenario-name", default=ACTOR_A_SCENARIO_NAME)
+    parser.add_argument("--actor-b-path", default=str(ACTOR_B_PATH))
+    parser.add_argument("--actor-b-scenario-name", default=ACTOR_B_SCENARIO_NAME)
+    parser.add_argument("--lowlevel-actor-path", default=str(LOWLEVEL_ACTOR_PATH))
+    parser.add_argument("--num-episodes", type=int, default=NUM_EPISODES)
+    parser.add_argument("--seed", type=int, default=SEED)
+    parser.add_argument("--device", default=DEVICE, help="auto / cpu / cuda:0")
+    parser.add_argument("--deterministic", type=str_to_bool, default=DETERMINISTIC)
+    parser.add_argument("--win-reward-margin", type=float, default=WIN_REWARD_MARGIN)
+    parser.add_argument("--swap-actor-order", type=str_to_bool, default=SWAP_ACTOR_ORDER)
+    parser.add_argument("--random-side-swap", type=str_to_bool, default=RANDOM_SIDE_SWAP)
+    parser.add_argument("--custom-initial-states-json", default=None)
+    parser.add_argument("--initial-state-mode", choices=["fixed", "random"], default=INITIAL_STATE_MODE)
+    parser.add_argument("--random-initial-state-config-json", default=None)
+    parser.add_argument("--save-acmi", type=str_to_bool, default=SAVE_ACMI)
+    parser.add_argument("--acmi-episodes", default=",".join(str(item) for item in sorted(ACMI_EPISODES)))
+    parser.add_argument("--output-root", default=str(OUTPUT_ROOT))
+    parser.add_argument("--output-dir", default=None)
+    parser.add_argument("--save-plots", type=str_to_bool, default=SAVE_PLOTS)
+    parser.add_argument("--plot-dpi", type=int, default=PLOT_DPI)
+    parser.add_argument("--moving-average-window", type=int, default=MOVING_AVERAGE_WINDOW)
+    parser.add_argument("--plot-only-result-dir", default=PLOT_ONLY_RESULT_DIR)
+    parser.add_argument("--suppress-policy-debug-print", type=str_to_bool, default=SUPPRESS_POLICY_DEBUG_PRINT)
+    return parser
+
+
+def apply_cli_args(args: argparse.Namespace) -> None:
+    """把 CLI 参数写回旧脚本使用的全局配置，尽量不扰动原有评估逻辑。"""
+    global EXPERIMENT_NAME, EVAL_SCENARIO_NAME
+    global ACTOR_A_PATH, ACTOR_A_SCENARIO_NAME, ACTOR_B_PATH, ACTOR_B_SCENARIO_NAME
+    global LOWLEVEL_ACTOR_PATH, NUM_EPISODES, SEED, DEVICE, DETERMINISTIC
+    global WIN_REWARD_MARGIN, SWAP_ACTOR_ORDER, RANDOM_SIDE_SWAP, CUSTOM_INITIAL_STATES
+    global INITIAL_STATE_MODE, RANDOM_INITIAL_STATE_CONFIG
+    global SAVE_ACMI, ACMI_EPISODES, OUTPUT_ROOT, OUTPUT_DIR, SAVE_PLOTS
+    global PLOT_DPI, MOVING_AVERAGE_WINDOW, PLOT_ONLY_RESULT_DIR, SUPPRESS_POLICY_DEBUG_PRINT
+
+    EXPERIMENT_NAME = args.experiment_name
+    EVAL_SCENARIO_NAME = args.eval_scenario_name
+    ACTOR_A_PATH = cli_path(args.actor_a_path)
+    ACTOR_A_SCENARIO_NAME = args.actor_a_scenario_name
+    ACTOR_B_PATH = cli_path(args.actor_b_path)
+    ACTOR_B_SCENARIO_NAME = args.actor_b_scenario_name
+    LOWLEVEL_ACTOR_PATH = cli_path(args.lowlevel_actor_path)
+    NUM_EPISODES = int(args.num_episodes)
+    SEED = int(args.seed)
+    DEVICE = args.device
+    DETERMINISTIC = bool(args.deterministic)
+    WIN_REWARD_MARGIN = float(args.win_reward_margin)
+    SWAP_ACTOR_ORDER = bool(args.swap_actor_order)
+    RANDOM_SIDE_SWAP = bool(args.random_side_swap)
+    CUSTOM_INITIAL_STATES = parse_custom_initial_states(args.custom_initial_states_json)
+    INITIAL_STATE_MODE = args.initial_state_mode
+    RANDOM_INITIAL_STATE_CONFIG = parse_random_initial_state_config(args.random_initial_state_config_json)
+    SAVE_ACMI = bool(args.save_acmi)
+    ACMI_EPISODES = parse_acmi_episodes(args.acmi_episodes)
+    OUTPUT_ROOT = cli_path(args.output_root)
+    OUTPUT_DIR = cli_path(args.output_dir)
+    SAVE_PLOTS = bool(args.save_plots)
+    PLOT_DPI = int(args.plot_dpi)
+    MOVING_AVERAGE_WINDOW = int(args.moving_average_window)
+    PLOT_ONLY_RESULT_DIR = cli_path(args.plot_only_result_dir)
+    SUPPRESS_POLICY_DEBUG_PRINT = bool(args.suppress_policy_debug_print)
 
 
 TASK_FAMILY = {
@@ -245,23 +431,93 @@ class ActorController:
         self.lowlevel_rnn_states = _t2n(self.lowlevel_rnn_states)
         return _t2n(lowlevel_action).squeeze(0)
 
-    def _heading_error_to_vector(self, env: SingleCombatEnv, agent_id: str, target_xy: np.ndarray) -> float:
+    # ---- Tactical 辅助方法（与 TacticalHierarchicalSingleCombatTask 保持一致） ----
+
+    # 12 个战术动作常量
+    PURE_PURSUIT = 0
+    LEAD_PURSUIT = 1
+    LAG_PURSUIT = 2
+    DISENGAGE = 3
+    CLIMB_POSITION = 4
+    DIVE_ACCELERATE = 5
+    LEVEL_ACCELERATE = 6
+    LEVEL_DECELERATE = 7
+    DEFENSIVE_TURN_LEFT = 8
+    DEFENSIVE_TURN_RIGHT = 9
+    HIGH_YOYO = 10
+    LOW_YOYO = 11
+
+    _norm_delta_heading = np.array([-np.pi / 6, -np.pi / 12, 0.0, np.pi / 12, np.pi / 6], dtype=np.float32)
+
+    def _safe_unit_vector(self, vector, fallback=None):
+        vector = np.asarray(vector, dtype=np.float32)
+        norm = np.linalg.norm(vector)
+        if norm > 1e-6:
+            return vector / norm
+        if fallback is None:
+            return np.zeros_like(vector, dtype=np.float32)
+        fallback = np.asarray(fallback, dtype=np.float32)
+        fallback_norm = np.linalg.norm(fallback)
+        if fallback_norm > 1e-6:
+            return fallback / fallback_norm
+        return np.zeros_like(vector, dtype=np.float32)
+
+    def _ego_heading_vector(self, env: SingleCombatEnv, agent_id: str):
         ego = env.agents[agent_id]
         ego_xy = np.asarray(ego.get_velocity()[:2], dtype=np.float32)
-        target_xy = np.asarray(target_xy, dtype=np.float32)
+        if np.linalg.norm(ego_xy) > 1e-6:
+            return self._safe_unit_vector(ego_xy)
+        heading = ego.get_property_value(c.attitude_heading_true_rad)
+        return np.array([np.cos(heading), np.sin(heading)], dtype=np.float32)
 
-        if np.linalg.norm(ego_xy) < 1e-6:
-            heading = ego.get_property_value(c.attitude_heading_true_rad)
-            ego_xy = np.array([np.cos(heading), np.sin(heading)], dtype=np.float32)
+    def _rotate_vector(self, vector, angle):
+        cos_angle = np.cos(angle)
+        sin_angle = np.sin(angle)
+        return np.array([
+            vector[0] * cos_angle - vector[1] * sin_angle,
+            vector[0] * sin_angle + vector[1] * cos_angle,
+        ], dtype=np.float32)
+
+    def _combat_geometry(self, env: SingleCombatEnv, agent_id: str):
+        ego = env.agents[agent_id]
+        enm = ego.enemies[0]
+        ego_pos = np.asarray(ego.get_position(), dtype=np.float32)
+        enm_pos = np.asarray(enm.get_position(), dtype=np.float32)
+        ego_vel = np.asarray(ego.get_velocity(), dtype=np.float32)
+        enm_vel = np.asarray(enm.get_velocity(), dtype=np.float32)
+
+        relative = enm_pos - ego_pos
+        relative_xy = relative[:2]
+        distance_xy = np.linalg.norm(relative_xy)
+        if distance_xy < 1e-6:
+            relative_xy = self._ego_heading_vector(env, agent_id)
+            distance_xy = 0.0
+
+        return {
+            "ego": ego,
+            "enm": enm,
+            "ego_vel_xy": ego_vel[:2],
+            "enm_vel_xy": enm_vel[:2],
+            "relative_xy": relative_xy.astype(np.float32),
+            "distance_xy": float(distance_xy),
+            "ego_heading_xy": self._ego_heading_vector(env, agent_id),
+            "enm_heading_xy": self._safe_unit_vector(enm_vel[:2], fallback=relative_xy),
+        }
+
+    def _heading_error_to_vector(self, env: SingleCombatEnv, agent_id: str, target_xy: np.ndarray) -> float:
+        target_xy = np.asarray(target_xy, dtype=np.float32)
         if np.linalg.norm(target_xy) < 1e-6:
             return 0.0
-
-        ego_xy = ego_xy / (np.linalg.norm(ego_xy) + 1e-8)
-        target_xy = target_xy / (np.linalg.norm(target_xy) + 1e-8)
+        ego_xy = self._ego_heading_vector(env, agent_id)
+        target_xy = self._safe_unit_vector(target_xy, fallback=ego_xy)
         dot = np.clip(np.dot(ego_xy, target_xy), -1.0, 1.0)
         cross_z = ego_xy[0] * target_xy[1] - ego_xy[1] * target_xy[0]
         heading_error = np.arctan2(cross_z, dot)
         return float(np.clip(heading_error, -np.pi / 6, np.pi / 6))
+
+    def _quantize_heading_error(self, heading_error: float) -> float:
+        index = np.argmin(np.abs(self._norm_delta_heading - heading_error))
+        return float(self._norm_delta_heading[index])
 
     def _altitude_step_to_enemy(self, env: SingleCombatEnv, agent_id: str) -> float:
         ego = env.agents[agent_id]
@@ -273,46 +529,96 @@ class ActorController:
             return -0.1
         return 0.0
 
+    def _lead_target_vector(self, geometry):
+        ego_speed = np.linalg.norm(geometry["ego_vel_xy"])
+        lead_time = np.clip(geometry["distance_xy"] / (ego_speed + 1e-6), 1.0, 3.0)
+        return geometry["relative_xy"] + geometry["enm_vel_xy"] * lead_time
+
+    def _lag_target_vector(self, geometry):
+        lag_distance = np.clip(geometry["distance_xy"] * 0.35, 300.0, 900.0)
+        return geometry["relative_xy"] - geometry["enm_heading_xy"] * lag_distance
+
+    def _blend_with_enemy_vector(self, geometry, enemy_weight=0.7):
+        enemy_vector = self._safe_unit_vector(geometry["relative_xy"], fallback=geometry["ego_heading_xy"])
+        ego_vector = geometry["ego_heading_xy"]
+        return enemy_vector * enemy_weight + ego_vector * (1.0 - enemy_weight)
+
+    def _apply_tactical_safety(self, env: SingleCombatEnv, agent_id: str, action_id: int,
+                               delta_altitude: float, delta_velocity: float, distance_xy: float):
+        ego = env.agents[agent_id]
+        altitude = ego.get_property_value(c.position_h_sl_m)
+        altitude_limit = 2500  # 默认低高度限制
+
+        if delta_altitude < 0.0 and altitude <= altitude_limit + 1000:
+            delta_altitude = 0.1 if altitude <= altitude_limit + 500 else 0.0
+
+        close_distance = min(3.0 * 1000 * 0.35, 1200.0)
+        if action_id in (self.PURE_PURSUIT, self.LEAD_PURSUIT) and distance_xy < close_distance:
+            delta_velocity = 0.0
+
+        return delta_altitude, delta_velocity
+
     def _tactical_action_to_delta_control(
         self,
         env: SingleCombatEnv,
         agent_id: str,
         action_id: int,
     ) -> np.ndarray:
-        ego = env.agents[agent_id]
-        enm = ego.enemies[0]
-        relative_xy = np.asarray((enm.get_position() - ego.get_position())[:2], dtype=np.float32)
-        if np.linalg.norm(relative_xy) < 1e-6:
-            relative_xy = np.asarray(ego.get_velocity()[:2], dtype=np.float32)
+        geometry = self._combat_geometry(env, agent_id)
+        relative_xy = geometry["relative_xy"]
+        ego_heading_xy = geometry["ego_heading_xy"]
+        distance_xy = geometry["distance_xy"]
 
-        target_xy = relative_xy
         delta_altitude = 0.0
         delta_velocity = 0.0
 
-        # 与 TacticalHierarchicalSingleCombatTask 保持一致的 6 个战术动作编号。
-        if action_id == 0:  # 追击
+        if action_id == self.PURE_PURSUIT:
             target_xy = relative_xy
             delta_altitude = self._altitude_step_to_enemy(env, agent_id)
             delta_velocity = 0.05
-        elif action_id == 1:  # 脱离
+        elif action_id == self.LEAD_PURSUIT:
+            target_xy = self._lead_target_vector(geometry)
+            delta_altitude = self._altitude_step_to_enemy(env, agent_id)
+            delta_velocity = 0.05 if distance_xy > 2000.0 else 0.0
+        elif action_id == self.LAG_PURSUIT:
+            target_xy = self._lag_target_vector(geometry)
+            delta_altitude = self._altitude_step_to_enemy(env, agent_id)
+            delta_velocity = -0.05 if distance_xy < 1500.0 else 0.0
+        elif action_id == self.DISENGAGE:
             target_xy = -relative_xy
             delta_velocity = 0.05
-        elif action_id == 2:  # 爬升
+        elif action_id == self.CLIMB_POSITION:
             target_xy = relative_xy
             delta_altitude = 0.1
-            delta_velocity = -0.05
-        elif action_id == 3:  # 俯冲
+        elif action_id == self.DIVE_ACCELERATE:
             target_xy = relative_xy
             delta_altitude = -0.1
             delta_velocity = 0.05
-        elif action_id == 4:  # 左转
-            target_xy = np.array([-relative_xy[1], relative_xy[0]], dtype=np.float32)
-        elif action_id == 5:  # 右转
-            target_xy = np.array([relative_xy[1], -relative_xy[0]], dtype=np.float32)
+        elif action_id == self.LEVEL_ACCELERATE:
+            target_xy = ego_heading_xy
+            delta_velocity = 0.05
+        elif action_id == self.LEVEL_DECELERATE:
+            target_xy = ego_heading_xy
+            delta_velocity = -0.05
+        elif action_id == self.DEFENSIVE_TURN_LEFT:
+            target_xy = self._rotate_vector(ego_heading_xy, np.pi / 2)
+        elif action_id == self.DEFENSIVE_TURN_RIGHT:
+            target_xy = self._rotate_vector(ego_heading_xy, -np.pi / 2)
+        elif action_id == self.HIGH_YOYO:
+            target_xy = self._blend_with_enemy_vector(geometry, enemy_weight=0.7)
+            delta_altitude = 0.1
+            delta_velocity = -0.05
+        elif action_id == self.LOW_YOYO:
+            target_xy = self._blend_with_enemy_vector(geometry, enemy_weight=0.7)
+            delta_altitude = -0.1
+            delta_velocity = 0.05
         else:
             raise ValueError(f"未知 tactical action id: {action_id}")
 
-        delta_heading = self._heading_error_to_vector(env, agent_id, target_xy)
+        delta_altitude, delta_velocity = self._apply_tactical_safety(
+            env, agent_id, action_id, delta_altitude, delta_velocity, distance_xy
+        )
+        delta_heading = self._quantize_heading_error(self._heading_error_to_vector(env, agent_id, target_xy))
         return np.array([delta_altitude, delta_heading, delta_velocity], dtype=np.float32)
 
     def _tactical_to_lowlevel(
@@ -425,8 +731,162 @@ def validate_setup(env: SingleCombatEnv, controllers: Iterable[ActorController])
             )
 
 
+def config_range(config: Dict[str, object], key: str, default: Tuple[float, float]) -> Tuple[float, float]:
+    """从配置中读取 [min, max] 范围；单个数值会被视为固定值。"""
+    value = config.get(key, default)
+    if isinstance(value, (int, float)):
+        return float(value), float(value)
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        return float(value[0]), float(value[1])
+    raise ValueError(f"随机初始态配置 {key} 必须是单个数值或长度为 2 的范围，当前值={value}")
+
+
+def sample_uniform(rng, config: Dict[str, object], key: str, default: Tuple[float, float]) -> float:
+    low, high = config_range(config, key, default)
+    if low > high:
+        raise ValueError(f"随机初始态配置 {key} 下界不能大于上界: {low} > {high}")
+    return float(rng.uniform(low, high))
+
+
+def wrap_heading_deg(value: float) -> float:
+    """把航向角约束到 [0, 360) deg。"""
+    return float(value % 360.0)
+
+
+def noisy_heading_deg(rng, base_heading_deg: float, noise_deg: float) -> float:
+    return wrap_heading_deg(base_heading_deg + float(rng.uniform(-noise_deg, noise_deg)))
+
+
+def sample_heading_pair(rng, bearing_deg: float, config: Dict[str, object]) -> Tuple[float, float, str]:
+    """根据交战几何采样双方初始航向。"""
+    mode = str(config.get("heading_mode", "mixed")).lower()
+    if mode == "mixed":
+        mode = str(rng.choice(["head_on", "tail_chase", "crossing", "random"]))
+
+    noise_deg = float(config.get("heading_noise_deg", 20.0))
+    if mode == "head_on":
+        a_heading = noisy_heading_deg(rng, bearing_deg, noise_deg)
+        b_heading = noisy_heading_deg(rng, bearing_deg + 180.0, noise_deg)
+    elif mode == "tail_chase":
+        a_heading = noisy_heading_deg(rng, bearing_deg, noise_deg)
+        b_heading = noisy_heading_deg(rng, bearing_deg, noise_deg)
+    elif mode == "crossing":
+        sign = float(rng.choice([-1.0, 1.0]))
+        a_heading = noisy_heading_deg(rng, bearing_deg + sign * 90.0, noise_deg)
+        b_heading = noisy_heading_deg(rng, bearing_deg - sign * 90.0, noise_deg)
+    elif mode == "random":
+        a_heading = float(rng.uniform(0.0, 360.0))
+        b_heading = float(rng.uniform(0.0, 360.0))
+    else:
+        raise ValueError(f"未知 heading_mode: {mode}")
+    return a_heading, b_heading, mode
+
+
+def sample_random_initial_states(
+    env: SingleCombatEnv,
+    base_init_states: List[Dict[str, object]],
+) -> Tuple[List[Dict[str, object]], Dict[str, object]]:
+    """为 1v1 每局生成新的初始交战几何。"""
+    if len(base_init_states) != 2:
+        raise ValueError("随机初始态采样目前只支持 1v1 两架飞机。")
+    if NEU2LLA is None:
+        raise RuntimeError("缺少 NEU2LLA，无法生成随机经纬度初始状态。")
+
+    rng = env.np_random
+    config = RANDOM_INITIAL_STATE_CONFIG
+    horizontal_distance_m = sample_uniform(rng, config, "distance_m", (800.0, 6000.0))
+    center_north_m = sample_uniform(rng, config, "center_north_m", (-1500.0, 1500.0))
+    center_east_m = sample_uniform(rng, config, "center_east_m", (-1500.0, 1500.0))
+    altitude_ft = sample_uniform(rng, config, "altitude_ft", (16000.0, 26000.0))
+    altitude_difference_ft = sample_uniform(
+        rng, config, "altitude_difference_ft", (-3000.0, 3000.0)
+    )
+    a_speed_fps = sample_uniform(rng, config, "speed_fps", (650.0, 950.0))
+    b_speed_fps = sample_uniform(rng, config, "speed_fps", (650.0, 950.0))
+
+    bearing_rad = float(rng.uniform(0.0, 2.0 * np.pi))
+    bearing_deg = wrap_heading_deg(np.rad2deg(bearing_rad))
+    direction_ne = np.array([np.cos(bearing_rad), np.sin(bearing_rad)], dtype=np.float64)
+    half_distance = horizontal_distance_m / 2.0
+
+    a_ne = np.array([center_north_m, center_east_m], dtype=np.float64) - direction_ne * half_distance
+    b_ne = np.array([center_north_m, center_east_m], dtype=np.float64) + direction_ne * half_distance
+    a_alt_ft = altitude_ft - altitude_difference_ft / 2.0
+    b_alt_ft = altitude_ft + altitude_difference_ft / 2.0
+    a_alt_m = a_alt_ft * 0.3048
+    b_alt_m = b_alt_ft * 0.3048
+
+    a_lon, a_lat, _ = NEU2LLA(
+        a_ne[0], a_ne[1], a_alt_m, env.center_lon, env.center_lat, env.center_alt
+    )
+    b_lon, b_lat, _ = NEU2LLA(
+        b_ne[0], b_ne[1], b_alt_m, env.center_lon, env.center_lat, env.center_alt
+    )
+    a_heading_deg, b_heading_deg, geometry_mode = sample_heading_pair(rng, bearing_deg, config)
+
+    init_states = [state.copy() for state in base_init_states]
+    sampled_values = [
+        (a_lon, a_lat, a_alt_ft, a_heading_deg, a_speed_fps),
+        (b_lon, b_lat, b_alt_ft, b_heading_deg, b_speed_fps),
+    ]
+    for init_state, (lon, lat, alt_ft, heading_deg, speed_fps) in zip(init_states, sampled_values):
+        init_state.update(
+            {
+                "ic_long_gc_deg": float(lon),
+                "ic_lat_geod_deg": float(lat),
+                "ic_h_sl_ft": float(alt_ft),
+                "ic_psi_true_deg": float(heading_deg),
+                "ic_u_fps": float(speed_fps),
+                "ic_v_fps": 0.0,
+                "ic_w_fps": 0.0,
+                "ic_p_rad_sec": 0.0,
+                "ic_q_rad_sec": 0.0,
+                "ic_r_rad_sec": 0.0,
+                "ic_roc_fpm": 0.0,
+            }
+        )
+
+    return init_states, {
+        "init_geometry_mode": geometry_mode,
+        "sampled_horizontal_distance_m": float(horizontal_distance_m),
+        "init_bearing_deg": float(bearing_deg),
+    }
+
+
+def build_initial_state_info(
+    env: SingleCombatEnv,
+    assigned_init_states: List[Dict[str, object]],
+    extra_info: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    """记录本局初始态，便于后续按场景分组分析。"""
+    agent_ids = list(env.agents.keys())
+    info = {
+        "initial_state_mode": INITIAL_STATE_MODE,
+        "init_geometry_mode": "",
+        "sampled_horizontal_distance_m": "",
+        "init_bearing_deg": "",
+        "init_distance_m": "",
+        "agent_states": {},
+    }
+    if extra_info:
+        info.update(extra_info)
+
+    for agent_id, init_state in zip(agent_ids, assigned_init_states):
+        info["agent_states"][agent_id] = {
+            "init_altitude_ft": float(init_state.get("ic_h_sl_ft", 0.0)),
+            "init_heading_deg": float(init_state.get("ic_psi_true_deg", 0.0)),
+            "init_speed_fps": float(init_state.get("ic_u_fps", 0.0)),
+        }
+
+    if len(agent_ids) >= 2:
+        first = np.asarray(env.agents[agent_ids[0]].get_position(), dtype=np.float64)
+        second = np.asarray(env.agents[agent_ids[1]].get_position(), dtype=np.float64)
+        info["init_distance_m"] = float(np.linalg.norm(second - first))
+    return info
+
+
 def reset_eval_env(env: SingleCombatEnv) -> np.ndarray:
-    """按脚本配置重置 1v1 环境，支持关闭随机换边或覆盖初始状态。"""
+    """按脚本配置重置 1v1 环境，支持固定或随机初始态。"""
     env.current_step = 0
 
     # 保存一份不随 sim.reload() 改变的基准初始状态，避免随机换边后下一局状态漂移。
@@ -441,14 +901,24 @@ def reset_eval_env(env: SingleCombatEnv) -> np.ndarray:
 
     env.init_states = [state.copy() for state in env._experiment_base_init_states]
 
-    init_states = [state.copy() for state in env.init_states]
-    if RANDOM_SIDE_SWAP:
+    if INITIAL_STATE_MODE == "random":
+        init_states, initial_extra_info = sample_random_initial_states(env, env.init_states)
+    elif INITIAL_STATE_MODE == "fixed":
+        init_states = [state.copy() for state in env.init_states]
+        initial_extra_info = None
+    else:
+        raise ValueError(f"未知 INITIAL_STATE_MODE: {INITIAL_STATE_MODE}")
+
+    if INITIAL_STATE_MODE == "fixed" and RANDOM_SIDE_SWAP:
         env.np_random.shuffle(init_states)
 
     for sim, init_state in zip(env.agents.values(), init_states):
         sim.reload(init_state)
     env._tempsims.clear()
     env.task.reset(env)
+    env._experiment_last_initial_state_info = build_initial_state_info(
+        env, init_states, initial_extra_info
+    )
     return env._pack(env.get_obs())
 
 
@@ -497,9 +967,12 @@ def decide_winner(
 
 
 def make_output_dir() -> Path:
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = OUTPUT_ROOT / f"{EXPERIMENT_NAME}_{timestamp}"
-    output_dir.mkdir(parents=True, exist_ok=False)
+    if OUTPUT_DIR is not None:
+        output_dir = Path(OUTPUT_DIR)
+    else:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_dir = Path(OUTPUT_ROOT) / f"{EXPERIMENT_NAME}_{timestamp}"
+    output_dir.mkdir(parents=True, exist_ok=True)
     if SAVE_ACMI:
         (output_dir / "acmi").mkdir(parents=True, exist_ok=True)
     if SAVE_PLOTS:
@@ -584,6 +1057,9 @@ def build_summary(rows: List[Dict[str, object]], output_dir: Path) -> Dict[str, 
         "actor_b_path": str(ACTOR_B_PATH),
         "actor_b_scenario_name": ACTOR_B_SCENARIO_NAME,
         "num_episodes": total,
+        "initial_state_mode": INITIAL_STATE_MODE,
+        "random_side_swap": RANDOM_SIDE_SWAP,
+        "random_initial_state_config": RANDOM_INITIAL_STATE_CONFIG,
         "actor_a_win_rate": actor_a_wins / total if total else 0.0,
         "actor_b_win_rate": actor_b_wins / total if total else 0.0,
         "tie_rate": ties / total if total else 0.0,
@@ -745,6 +1221,31 @@ def summarize_relative_history(history: Dict[str, List[float]]) -> Dict[str, flo
     }
 
 
+def initial_state_row(
+    env: SingleCombatEnv,
+    actor_a_agent_id: str,
+    actor_b_agent_id: str,
+) -> Dict[str, object]:
+    """把本局初始条件转换为 CSV 字段，方便解释不同测试场景。"""
+    info = getattr(env, "_experiment_last_initial_state_info", {})
+    agent_states = info.get("agent_states", {})
+    actor_a_state = agent_states.get(actor_a_agent_id, {})
+    actor_b_state = agent_states.get(actor_b_agent_id, {})
+    return {
+        "initial_state_mode": info.get("initial_state_mode", INITIAL_STATE_MODE),
+        "init_geometry_mode": info.get("init_geometry_mode", ""),
+        "init_distance_m": info.get("init_distance_m", ""),
+        "sampled_horizontal_distance_m": info.get("sampled_horizontal_distance_m", ""),
+        "init_bearing_deg": info.get("init_bearing_deg", ""),
+        "actor_a_init_altitude_ft": actor_a_state.get("init_altitude_ft", ""),
+        "actor_b_init_altitude_ft": actor_b_state.get("init_altitude_ft", ""),
+        "actor_a_init_heading_deg": actor_a_state.get("init_heading_deg", ""),
+        "actor_b_init_heading_deg": actor_b_state.get("init_heading_deg", ""),
+        "actor_a_init_speed_fps": actor_a_state.get("init_speed_fps", ""),
+        "actor_b_init_speed_fps": actor_b_state.get("init_speed_fps", ""),
+    }
+
+
 def moving_average(values: np.ndarray, window: int) -> Tuple[np.ndarray, np.ndarray]:
     """计算滑动平均，用于在回合数较多时观察整体趋势。"""
     if window <= 1 or values.size < window:
@@ -789,8 +1290,8 @@ def plot_reward_curve(rows: List[Dict[str, object]], plot_dir: Path) -> Path:
     actor_b_rewards = numeric_series(rows, "actor_b_reward")
 
     fig, ax = plt.subplots(figsize=(10, 5))
-    add_line_with_average(ax, episode_ids, actor_a_rewards, "Actor A", "#1f77b4")
-    add_line_with_average(ax, episode_ids, actor_b_rewards, "Actor B", "#d62728")
+    add_line_with_average(ax, episode_ids, actor_a_rewards, "Actor A", ACTOR_A_COLOR)
+    add_line_with_average(ax, episode_ids, actor_b_rewards, "Actor B", ACTOR_B_COLOR)
     ax.set_title("各回合累计奖励曲线")
     ax.set_xlabel("Episode")
     ax.set_ylabel("累计奖励")
@@ -839,7 +1340,7 @@ def plot_outcome_curve(rows: List[Dict[str, object]], plot_dir: Path) -> Path:
         winners.count("actor_b"),
         winners.count("tie"),
     ]
-    bars = axes[0].bar(labels, counts, color=["#1f77b4", "#d62728", "#7f7f7f"])
+    bars = axes[0].bar(labels, counts, color=[ACTOR_A_COLOR, ACTOR_B_COLOR, TIE_COLOR])
     axes[0].set_title("胜负结果统计")
     axes[0].set_ylabel("回合数")
     for bar in bars:
@@ -853,9 +1354,9 @@ def plot_outcome_curve(rows: List[Dict[str, object]], plot_dir: Path) -> Path:
             va="bottom",
         )
 
-    axes[1].plot(episode_ids, actor_a_rate, marker="o", label="Actor A累计胜率")
-    axes[1].plot(episode_ids, actor_b_rate, marker="o", label="Actor B累计胜率")
-    axes[1].plot(episode_ids, tie_rate, marker="o", label="累计平局率")
+    axes[1].plot(episode_ids, actor_a_rate, marker="o", label="Actor A累计胜率", color=ACTOR_A_COLOR)
+    axes[1].plot(episode_ids, actor_b_rate, marker="o", label="Actor B累计胜率", color=ACTOR_B_COLOR)
+    axes[1].plot(episode_ids, tie_rate, marker="o", label="累计平局率", color=TIE_COLOR)
     axes[1].set_title("累计胜率/平局率")
     axes[1].set_xlabel("Episode")
     axes[1].set_ylabel("比例")
@@ -880,8 +1381,8 @@ def plot_terminal_metrics(rows: List[Dict[str, object]], plot_dir: Path) -> Path
     axes[0].grid(True, alpha=0.3)
     axes[0].legend()
 
-    axes[1].plot(episode_ids, actor_a_bloods, marker="o", label="Actor A血量", color="#1f77b4")
-    axes[1].plot(episode_ids, actor_b_bloods, marker="o", label="Actor B血量", color="#d62728")
+    axes[1].plot(episode_ids, actor_a_bloods, marker="o", label="Actor A血量", color=ACTOR_A_COLOR)
+    axes[1].plot(episode_ids, actor_b_bloods, marker="o", label="Actor B血量", color=ACTOR_B_COLOR)
     axes[1].set_title("每回合终局血量")
     axes[1].set_xlabel("Episode")
     axes[1].set_ylabel("血量")
@@ -910,16 +1411,16 @@ def plot_tactical_metrics(rows: List[Dict[str, object]], plot_dir: Path) -> Opti
     axes[0].legend()
 
     if actor_a_mean_ao is not None and actor_b_mean_ao is not None:
-        add_line_with_average(axes[1], episode_ids[: actor_a_mean_ao.size], actor_a_mean_ao, "Actor A 平均 AO", "#1f77b4")
-        add_line_with_average(axes[1], episode_ids[: actor_b_mean_ao.size], actor_b_mean_ao, "Actor B 平均 AO", "#d62728")
+        add_line_with_average(axes[1], episode_ids[: actor_a_mean_ao.size], actor_a_mean_ao, "Actor A 平均 AO", ACTOR_A_COLOR)
+        add_line_with_average(axes[1], episode_ids[: actor_b_mean_ao.size], actor_b_mean_ao, "Actor B 平均 AO", ACTOR_B_COLOR)
     axes[1].set_title("整局平均 AO 曲线")
     axes[1].set_ylabel("AO(deg)")
     axes[1].grid(True, alpha=0.3)
     axes[1].legend()
 
     if actor_a_mean_ta is not None and actor_b_mean_ta is not None:
-        add_line_with_average(axes[2], episode_ids[: actor_a_mean_ta.size], actor_a_mean_ta, "Actor A 平均 TA", "#1f77b4")
-        add_line_with_average(axes[2], episode_ids[: actor_b_mean_ta.size], actor_b_mean_ta, "Actor B 平均 TA", "#d62728")
+        add_line_with_average(axes[2], episode_ids[: actor_a_mean_ta.size], actor_a_mean_ta, "Actor A 平均 TA", ACTOR_A_COLOR)
+        add_line_with_average(axes[2], episode_ids[: actor_b_mean_ta.size], actor_b_mean_ta, "Actor B 平均 TA", ACTOR_B_COLOR)
     axes[2].set_title("整局平均 TA 曲线")
     axes[2].set_xlabel("Episode")
     axes[2].set_ylabel("TA(deg)")
@@ -937,8 +1438,8 @@ def plot_status_counts(rows: List[Dict[str, object]], plot_dir: Path) -> Path:
     width = 0.36
 
     fig, ax = plt.subplots(figsize=(9, 5))
-    ax.bar(x - width / 2, actor_a_counts, width, label="Actor A", color="#1f77b4")
-    ax.bar(x + width / 2, actor_b_counts, width, label="Actor B", color="#d62728")
+    ax.bar(x - width / 2, actor_a_counts, width, label="Actor A", color=ACTOR_A_COLOR)
+    ax.bar(x + width / 2, actor_b_counts, width, label="Actor B", color=ACTOR_B_COLOR)
     ax.set_title("终局状态统计")
     ax.set_xticks(x)
     ax.set_xticklabels(status_labels)
@@ -968,16 +1469,16 @@ def plot_missile_stats(rows: List[Dict[str, object]], plot_dir: Path) -> Optiona
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.8))
     width = 0.35
-    axes[0].bar(episode_ids - width / 2, actor_a_launched, width, label="Actor A发射")
-    axes[0].bar(episode_ids + width / 2, actor_b_launched, width, label="Actor B发射")
+    axes[0].bar(episode_ids - width / 2, actor_a_launched, width, label="Actor A发射", color=ACTOR_A_COLOR)
+    axes[0].bar(episode_ids + width / 2, actor_b_launched, width, label="Actor B发射", color=ACTOR_B_COLOR)
     axes[0].set_title("各回合导弹发射数")
     axes[0].set_xlabel("Episode")
     axes[0].set_ylabel("发射数")
     axes[0].grid(True, axis="y", alpha=0.3)
     axes[0].legend()
 
-    axes[1].bar(episode_ids - width / 2, actor_a_hits, width, label="Actor A命中")
-    axes[1].bar(episode_ids + width / 2, actor_b_hits, width, label="Actor B命中")
+    axes[1].bar(episode_ids - width / 2, actor_a_hits, width, label="Actor A命中", color=ACTOR_A_COLOR)
+    axes[1].bar(episode_ids + width / 2, actor_b_hits, width, label="Actor B命中", color=ACTOR_B_COLOR)
     axes[1].set_title("各回合导弹命中数")
     axes[1].set_xlabel("Episode")
     axes[1].set_ylabel("命中数")
@@ -1101,6 +1602,7 @@ def run_episode(
     actor_a_missiles = missile_stats(env, actor_a_agent_id)
     actor_b_missiles = missile_stats(env, actor_b_agent_id)
     relative_summary = summarize_relative_history(relative_history)
+    initial_summary = initial_state_row(env, actor_a_agent_id, actor_b_agent_id)
 
     row = {
         "episode": episode,
@@ -1112,6 +1614,7 @@ def run_episode(
         "actor_a_reward": actor_rewards["actor_a"],
         "actor_b_reward": actor_rewards["actor_b"],
         "reward_margin": actor_rewards["actor_a"] - actor_rewards["actor_b"],
+        **initial_summary,
         **relative_summary,
         "actor_a_bloods": float(actor_a_sim.bloods),
         "actor_b_bloods": float(actor_b_sim.bloods),
@@ -1148,7 +1651,10 @@ def plot_existing_results(result_dir: Path) -> None:
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 
 
-def main() -> None:
+def main(argv: Optional[List[str]] = None) -> None:
+    args = build_arg_parser().parse_args(argv)
+    apply_cli_args(args)
+
     if PLOT_ONLY_RESULT_DIR is not None:
         plot_existing_results(Path(PLOT_ONLY_RESULT_DIR))
         return
@@ -1198,4 +1704,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    main(sys.argv[1:])
