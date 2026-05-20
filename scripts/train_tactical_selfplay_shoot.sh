@@ -3,7 +3,7 @@
 env="SingleCombat"
 scenario="1v1/ShootMissile/TacticalHierarchySelfplay"
 algo="ppo"
-exp="1v1_tactical_hierarchy_shoot"
+exp="1v1_tactical_hierarchy_shoot_2"
 seed=1
 export WANDB_MODE="offline"
 

@@ -195,6 +195,37 @@ class TestSingleCombatEnv:
             assert np.all(dones == done_buf[t])
         env.close()
 
+    def test_shoot_missile_respects_launch_window(self):
+        env = SingleCombatEnv("1v1/ShootMissile/Selfplay")
+        try:
+            env.seed(0)
+            env.reset()
+            agent_ids = (env.ego_ids + env.enm_ids)[:env.num_agents]
+
+            # 默认射击场景开局距离大于最大射程，shoot_flag=1 也不能直接发射。
+            for agent_id in agent_ids:
+                agent = env.agents[agent_id]
+                target = agent.enemies[0].get_position() - agent.get_position()
+                assert np.linalg.norm(target) > env.task.max_attack_distance
+
+            before_remaining = env.task.remaining_missiles.copy()
+            before_launched = {
+                agent_id: len(env.agents[agent_id].launch_missiles)
+                for agent_id in agent_ids
+            }
+            actions = [
+                np.array([20, 20, 20, 15, 1], dtype=np.int32)
+                for _ in range(env.num_agents)
+            ]
+
+            env.step(actions)
+
+            assert env.task.remaining_missiles == before_remaining
+            for agent_id in agent_ids:
+                assert len(env.agents[agent_id].launch_missiles) == before_launched[agent_id]
+        finally:
+            env.close()
+
     @pytest.mark.parametrize("config", ["1v1/NoWeapon/vsBaseline", "1v1/NoWeapon/Selfplay"])
     def test_agent_crash(self, config):
         # if no weapon, once enemy die, env terminate!

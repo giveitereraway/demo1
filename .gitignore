@@ -4,7 +4,7 @@ results
 runs
 *.npy
 *.acmi
-output
+output/
 
 # vscode config
 .vscode
