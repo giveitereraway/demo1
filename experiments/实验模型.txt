@@ -1,0 +1,9 @@
+1v1/NoWeapon:
+Selfplay模型: scripts\results\SingleCombat\1v1\NoWeapon\Selfplay\ppo\1v1_follow\wandb\offline-run-20260512_175151-yryla8wg\files
+HierarchySelfplay模型: scripts\results\SingleCombat\1v1\NoWeapon\HierarchySelfplay\ppo\1v1_follow_hierarchy_3\wandb\offline-run-20260513_112510-k33hp7hh\files
+TacticalHierarchySelfplay模型: scripts\results\SingleCombat\1v1\NoWeapon\TacticalHierarchySelfplay\ppo\1v1_tactical_hierarchy_2\wandb\offline-run-20260516_131027-v6k42xjz\files
+
+1v1/ShootMissile:
+Selfplay模型: scripts\results\SingleCombat\1v1\ShootMissile\Selfplay\ppo\1v1_shoot_selfplay\wandb\offline-run-20260514_140253-yxrmu45m\files
+HierarchySelfplay模型: scripts\results\SingleCombat\1v1\ShootMissile\HierarchySelfplay\ppo\1v1_shoot_hierarchy\wandb\offline-run-20260515_160545-s6vfbap6\files
+TacticalHierarchySelfplay模型: scripts\results\SingleCombat\1v1\ShootMissile\TacticalHierarchySelfplay\ppo\1v1_tactical_hierarchy_shoot_2\wandb\offline-run-20260520_143521-lk4tkygw\files

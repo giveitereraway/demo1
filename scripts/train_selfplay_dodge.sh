@@ -1,9 +1,9 @@
 #!/bin/sh
 
 env="SingleCombat"
-scenario="1v1/DodgeMissile/Selfplay"
+scenario="1v1/DodgeMissile/TacticalHierarchySelfplay"
 algo="ppo"
-exp="1v1_dodge_selfplay"
+exp="1v1_dodge_tactical"
 seed=1
 export WANDB_MODE="offline"
 

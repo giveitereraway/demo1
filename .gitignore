@@ -5,6 +5,7 @@ runs
 *.npy
 *.acmi
 output/
+outputs/
 
 # vscode config
 .vscode

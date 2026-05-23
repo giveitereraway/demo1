@@ -11,6 +11,20 @@ DEFAULT_SILICONFLOW_BASE_URL = "https://api.siliconflow.cn/v1"
 DEFAULT_AGENT_MODEL = "Qwen/Qwen3.5-122B-A10B"
 DEFAULT_RAG_PROJECT_ROOT = Path(r"E:\AI_practice\Agentic_RAG")
 DEFAULT_AGENT_PYTHON_ENV = Path(r"C:\ProgramData\anaconda3\envs\jsbsim")
+DEFAULT_TACTICAL_ACTOR_PATH = (
+    REPO_ROOT
+    / "scripts"
+    / "results"
+    / "SingleCombat"
+    / "1v1"
+    / "NoWeapon"
+    / "TacticalHierarchySelfplay"
+    / "ppo"
+    / "1v1_tactical_hierarchy_2"
+    / "wandb"
+    / "offline-run-20260516_131027-v6k42xjz"
+    / "files"
+)
 
 
 def load_dotenv(path: Path | None = None) -> None:

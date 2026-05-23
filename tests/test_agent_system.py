@@ -7,11 +7,13 @@ from types import SimpleNamespace
 from agent_system.commands import (
     Eval1v1Config,
     HumanLoopConfig,
+    TacticalDemoConfig,
     TrainConfig,
     VisualizeConfig,
     _path,
     build_eval_1v1_command,
     build_human_loop_command,
+    build_tactical_demo_command,
     build_train_command,
     build_visualize_command,
 )
@@ -19,7 +21,13 @@ from agent_system.executor import run_command
 from agent_system.result_analysis import infer_result_dir
 from agent_system.routing import keyword_route, parse_route_json
 from agent_system.settings import AgentSettings
+from agent_system.settings import DEFAULT_TACTICAL_ACTOR_PATH
 from agent_system.settings import REPO_ROOT
+from agent_system.tactical_actions import ACTION_BY_ID, action_name_matches
+from agent_system.tactical_parser import keyword_parse_tactical_instruction, parse_tactical_json
+from agent_system.tactical_policy import resolve_actor_checkpoint_path
+from agent_system.tactical_safety import TacticalSafetyState, apply_tactical_safety
+from agent_system.tactical_scheduler import TacticalActionScheduler
 
 
 def test_keyword_route_eval() -> None:
@@ -88,6 +96,130 @@ def test_build_human_and_visualize_commands() -> None:
     visualize = build_visualize_command(VisualizeConfig(model_dir="scripts/results/demo"))
     assert "render_jsbsim.py" in visualize.preview()
     assert "--model-dir" in visualize.command
+
+
+def test_tactical_action_catalog_has_12_named_actions() -> None:
+    assert len(ACTION_BY_ID) == 12
+    assert ACTION_BY_ID[0].code == "PURE_PURSUIT"
+    assert ACTION_BY_ID[11].chinese_name == "低悠悠"
+    assert action_name_matches(1, "LEAD_PURSUIT")
+    assert not action_name_matches(1, "LAG_PURSUIT")
+
+
+def test_tactical_keyword_parser_maps_chinese_phrases() -> None:
+    assert keyword_parse_tactical_instruction("追击敌机").action_id == 0
+    assert keyword_parse_tactical_instruction("抢占敌机前方").action_id == 1
+    assert keyword_parse_tactical_instruction("减速避免冲过头").action_id == 7
+    assert keyword_parse_tactical_instruction("向左防御转弯").action_id == 8
+    assert not keyword_parse_tactical_instruction("先搜索目标再规划复杂任务").valid
+
+
+def test_tactical_llm_json_validation() -> None:
+    valid = parse_tactical_json(
+        '```json\n{"scene":"1v1","agent_id":"A0100","tactical_action_id":1,'
+        '"tactical_action_name":"LEAD_PURSUIT","reason":"抢占前方"}\n```'
+    )
+    assert valid.valid
+    assert valid.action_id == 1
+
+    mismatch = parse_tactical_json(
+        '{"scene":"1v1","agent_id":"A0100","tactical_action_id":1,'
+        '"tactical_action_name":"LAG_PURSUIT","reason":"错误"}'
+    )
+    assert not mismatch.valid
+
+    out_of_range = parse_tactical_json(
+        '{"scene":"1v1","agent_id":"A0100","tactical_action_id":99,'
+        '"tactical_action_name":"UNKNOWN","reason":"错误"}'
+    )
+    assert not out_of_range.valid
+
+
+def test_tactical_scheduler_uses_actor_fallback_then_manual_hold() -> None:
+    scheduler = TacticalActionScheduler(hold_steps=2)
+    first = scheduler.select(actor_action_id=6)
+    assert first.source == "actor_fallback"
+    assert first.action_id == 6
+
+    manual = keyword_parse_tactical_instruction("爬升占位")
+    second = scheduler.select(actor_action_id=6, manual_decision=manual)
+    third = scheduler.select(actor_action_id=6)
+    fourth = scheduler.select(actor_action_id=6)
+
+    assert second.source == "manual"
+    assert second.action_id == 4
+    assert third.source == "manual"
+    assert third.action_id == 4
+    assert fourth.source == "actor_fallback"
+    assert fourth.action_id == 6
+
+
+def test_tactical_safety_overrides_risky_actions() -> None:
+    low_altitude = TacticalSafetyState(altitude_m=3200.0, altitude_limit_m=2500.0)
+    low_result = apply_tactical_safety(5, state=low_altitude, fallback_action_id=0)
+    assert low_result.action_id == 4
+    assert low_result.overridden
+
+    close_fast = TacticalSafetyState(distance_m=900.0, speed_mps=300.0)
+    close_result = apply_tactical_safety(1, state=close_fast, fallback_action_id=0)
+    assert close_result.action_id == 7
+    assert close_result.overridden
+
+    invalid = apply_tactical_safety(99, fallback_action_id=2)
+    assert invalid.action_id == 2
+    assert invalid.overridden
+
+
+def test_build_tactical_demo_command_uses_default_actor_and_enemy_paths() -> None:
+    spec = build_tactical_demo_command(
+        TacticalDemoConfig(
+            max_steps=5,
+            render_mode="none",
+            disable_llm=True,
+        )
+    )
+    assert "agent_tactical_1v1_demo.py" in spec.preview()
+    assert "--actor-path" in spec.command
+    assert "--enemy-path" in spec.command
+    assert "--enemy-action" not in spec.command
+    assert "--render-mode" in spec.command
+    assert "none" in spec.command
+    assert "--status-interval" in spec.command
+    assert "--step-sleep" in spec.command
+    assert "--disable-llm" in spec.command
+    assert spec.validation_errors == []
+    default_checkpoint = str(DEFAULT_TACTICAL_ACTOR_PATH / "actor_latest.pt")
+    assert spec.command.count(default_checkpoint) == 2
+
+    directory_spec = build_tactical_demo_command(
+        TacticalDemoConfig(actor_path=str(DEFAULT_TACTICAL_ACTOR_PATH), render_mode="none")
+    )
+    assert directory_spec.command.count(default_checkpoint) == 2
+    assert directory_spec.validation_errors == []
+
+    fixed_enemy = build_tactical_demo_command(
+        TacticalDemoConfig(enemy_action="PURE_PURSUIT", render_mode="none")
+    )
+    assert "--enemy-action" in fixed_enemy.command
+    assert "PURE_PURSUIT" in fixed_enemy.command
+    assert fixed_enemy.validation_errors == []
+
+    missing_enemy = build_tactical_demo_command(
+        TacticalDemoConfig(enemy_path="missing_enemy.pt", render_mode="none")
+    )
+    assert any("Enemy tactical actor" in item for item in missing_enemy.validation_errors)
+
+    invalid_enemy_action = build_tactical_demo_command(
+        TacticalDemoConfig(enemy_action="NOT_A_TACTIC", render_mode="none")
+    )
+    assert any("enemy-action" in item for item in invalid_enemy_action.validation_errors)
+
+    missing = build_tactical_demo_command(TacticalDemoConfig(actor_path="missing_actor.pt"))
+    assert any("Tactical actor 文件不存在" in item for item in missing.validation_errors)
+
+
+def test_resolve_actor_checkpoint_accepts_files_directory() -> None:
+    assert resolve_actor_checkpoint_path(DEFAULT_TACTICAL_ACTOR_PATH) == DEFAULT_TACTICAL_ACTOR_PATH / "actor_latest.pt"
 
 
 def test_infer_result_dir_from_json_output() -> None:

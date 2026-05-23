@@ -158,7 +158,127 @@ class HierarchicalSingleCombatDodgeMissileTask(HierarchicalSingleCombatTask, Sin
         return SingleCombatDodgeMissileTask.step(self, env)
 
 
-class TacticalHierarchicalSingleCombatDodgeMissileTask(TacticalHierarchicalSingleCombatTask, SingleCombatDodgeMissileTask):
+class TacticalMissileAwareMixin:
+    def _incoming_missile_geometry(self, env, agent_id):
+        ego = env.agents[agent_id]
+        missile_sim = ego.check_missile_warning()
+        if missile_sim is None:
+            return None
+
+        ego_pos = np.asarray(ego.get_position(), dtype=np.float32)
+        missile_pos = np.asarray(missile_sim.get_position(), dtype=np.float32)
+        ego_vel = np.asarray(ego.get_velocity(), dtype=np.float32)
+        missile_vel = np.asarray(missile_sim.get_velocity(), dtype=np.float32)
+
+        relative = missile_pos - ego_pos
+        relative_xy = relative[:2]
+        distance = float(np.linalg.norm(relative))
+        los_xy = self._safe_unit_vector(relative_xy, fallback=self._ego_heading_vector(env, agent_id))
+        relative_velocity = missile_vel - ego_vel
+        closing_speed = max(0.0, -float(np.dot(relative, relative_velocity) / (distance + 1e-6)))
+
+        danger_distance = getattr(self.config, "tactical_missile_danger_distance", 9000.0)
+        watch_distance = getattr(self.config, "max_attack_distance", 14000.0)
+        danger_closing_speed = getattr(self.config, "tactical_missile_danger_closing_speed", 150.0)
+        dangerous = distance <= danger_distance or (
+            distance <= watch_distance and closing_speed >= danger_closing_speed
+        )
+
+        return {
+            "distance": distance,
+            "closing_speed": closing_speed,
+            "los_xy": los_xy,
+            "away_xy": -los_xy,
+            "left_beam_xy": self._rotate_vector(los_xy, np.pi / 2),
+            "right_beam_xy": self._rotate_vector(los_xy, -np.pi / 2),
+            "dangerous": dangerous,
+        }
+
+    def _mix_tactical_vectors(self, primary, secondary, primary_weight):
+        primary_vector = self._safe_unit_vector(primary)
+        secondary_vector = self._safe_unit_vector(secondary, fallback=primary_vector)
+        return primary_vector * primary_weight + secondary_vector * (1.0 - primary_weight)
+
+    def _preferred_missile_beam(self, missile_geometry, ego_heading_xy):
+        left_score = np.dot(ego_heading_xy, missile_geometry["left_beam_xy"])
+        right_score = np.dot(ego_heading_xy, missile_geometry["right_beam_xy"])
+        return missile_geometry["left_beam_xy"] if left_score >= right_score else missile_geometry["right_beam_xy"]
+
+    def _missile_aware_action_to_delta_control(self, env, agent_id, action_id, missile_geometry):
+        geometry = self._combat_geometry(env, agent_id)
+        relative_xy = geometry["relative_xy"]
+        ego_heading_xy = geometry["ego_heading_xy"]
+        distance_xy = geometry["distance_xy"]
+        preferred_beam_xy = self._preferred_missile_beam(missile_geometry, ego_heading_xy)
+        close_threat_distance = getattr(self.config, "tactical_missile_close_distance", 3500.0)
+        close_threat = missile_geometry["distance"] <= close_threat_distance
+
+        delta_altitude = 0.0
+        delta_velocity = 0.0
+
+        if action_id in (self.PURE_PURSUIT, self.LEAD_PURSUIT, self.LAG_PURSUIT):
+            # 来袭导弹较近时，追击类动作改为带横切角的 crank，避免持续正对敌机暴露。
+            beam_weight = 0.8 if close_threat else 0.6
+            target_xy = self._mix_tactical_vectors(preferred_beam_xy, relative_xy, beam_weight)
+            delta_altitude = self._altitude_step_to_enemy(env, agent_id)
+            delta_velocity = 0.0 if close_threat else 0.05
+        elif action_id == self.DISENGAGE:
+            # 脱离动作优先远离来袭导弹，同时保留少量当前航向惯性。
+            target_xy = self._mix_tactical_vectors(missile_geometry["away_xy"], ego_heading_xy, 0.85)
+            delta_velocity = 0.05
+        elif action_id == self.CLIMB_POSITION:
+            # 爬升占位在导弹威胁下改为横切爬升，兼顾规避和高度安全。
+            target_xy = self._mix_tactical_vectors(preferred_beam_xy, relative_xy, 0.7)
+            delta_altitude = 0.1
+        elif action_id == self.DIVE_ACCELERATE:
+            # 俯冲加速转为 away + beam，避免只朝敌机方向俯冲导致被导弹追尾。
+            target_xy = self._mix_tactical_vectors(missile_geometry["away_xy"], preferred_beam_xy, 0.75)
+            delta_altitude = -0.1
+            delta_velocity = 0.05
+        elif action_id == self.LEVEL_ACCELERATE:
+            # 平飞加速优先把速度投到 away/beam 方向，保留规避能量。
+            target_xy = self._mix_tactical_vectors(missile_geometry["away_xy"], preferred_beam_xy, 0.6)
+            delta_velocity = 0.05
+        elif action_id == self.LEVEL_DECELERATE:
+            # 导弹威胁下不主动减速，保留能量做横切。
+            target_xy = preferred_beam_xy
+        elif action_id == self.DEFENSIVE_TURN_LEFT:
+            # 左/右防御转弯改为相对导弹视线的 beam/notch。
+            target_xy = missile_geometry["left_beam_xy"]
+            delta_velocity = 0.05
+        elif action_id == self.DEFENSIVE_TURN_RIGHT:
+            target_xy = missile_geometry["right_beam_xy"]
+            delta_velocity = 0.05
+        elif action_id == self.HIGH_YOYO:
+            # 高悠悠在导弹威胁下解释为横切爬升，减少迎头暴露。
+            target_xy = self._mix_tactical_vectors(preferred_beam_xy, relative_xy, 0.65)
+            delta_altitude = 0.1
+        elif action_id == self.LOW_YOYO:
+            # 低悠悠解释为横切加速脱离，用能量换规避窗口。
+            target_xy = self._mix_tactical_vectors(preferred_beam_xy, missile_geometry["away_xy"], 0.55)
+            delta_altitude = -0.1
+            delta_velocity = 0.05
+        else:
+            raise ValueError(f"Unknown tactical action id: {action_id}")
+
+        delta_altitude, delta_velocity = self._apply_tactical_safety(
+            env, agent_id, action_id, delta_altitude, delta_velocity, distance_xy
+        )
+        delta_heading = self._quantize_heading_error(self._heading_error_to_vector(env, agent_id, target_xy))
+        return np.array([delta_altitude, delta_heading, delta_velocity], dtype=np.float32)
+
+    def _tactical_action_to_delta_control(self, env, agent_id, action_id):
+        missile_geometry = self._incoming_missile_geometry(env, agent_id)
+        if missile_geometry is None or not missile_geometry["dangerous"]:
+            return TacticalHierarchicalSingleCombatTask._tactical_action_to_delta_control(
+                self, env, agent_id, action_id
+            )
+        return self._missile_aware_action_to_delta_control(env, agent_id, action_id, missile_geometry)
+
+
+class TacticalHierarchicalSingleCombatDodgeMissileTask(
+    TacticalMissileAwareMixin, TacticalHierarchicalSingleCombatTask, SingleCombatDodgeMissileTask
+):
 
     def __init__(self, config: str):
         TacticalHierarchicalSingleCombatTask.__init__(self, config)
@@ -284,7 +404,9 @@ class HierarchicalSingleCombatShootTask(HierarchicalSingleCombatTask, SingleComb
         SingleCombatShootMissileTask.step(self, env)
 
 
-class TacticalHierarchicalSingleCombatShootTask(TacticalHierarchicalSingleCombatTask, SingleCombatShootMissileTask):
+class TacticalHierarchicalSingleCombatShootTask(
+    TacticalMissileAwareMixin, TacticalHierarchicalSingleCombatTask, SingleCombatShootMissileTask
+):
     def __init__(self, config: str):
         TacticalHierarchicalSingleCombatTask.__init__(self, config)
         self.reward_functions = [
@@ -303,117 +425,6 @@ class TacticalHierarchicalSingleCombatShootTask(TacticalHierarchicalSingleCombat
 
     def get_obs(self, env, agent_id):
         return SingleCombatShootMissileTask.get_obs(self, env, agent_id)
-
-    def _incoming_missile_geometry(self, env, agent_id):
-        ego = env.agents[agent_id]
-        missile_sim = ego.check_missile_warning()
-        if missile_sim is None:
-            return None
-
-        ego_pos = np.asarray(ego.get_position(), dtype=np.float32)
-        missile_pos = np.asarray(missile_sim.get_position(), dtype=np.float32)
-        ego_vel = np.asarray(ego.get_velocity(), dtype=np.float32)
-        missile_vel = np.asarray(missile_sim.get_velocity(), dtype=np.float32)
-
-        relative = missile_pos - ego_pos
-        relative_xy = relative[:2]
-        distance = float(np.linalg.norm(relative))
-        los_xy = self._safe_unit_vector(relative_xy, fallback=self._ego_heading_vector(env, agent_id))
-        relative_velocity = missile_vel - ego_vel
-        closing_speed = max(0.0, -float(np.dot(relative, relative_velocity) / (distance + 1e-6)))
-
-        danger_distance = getattr(self.config, "tactical_missile_danger_distance", 9000.0)
-        watch_distance = getattr(self.config, "max_attack_distance", 14000.0)
-        danger_closing_speed = getattr(self.config, "tactical_missile_danger_closing_speed", 150.0)
-        dangerous = distance <= danger_distance or (
-            distance <= watch_distance and closing_speed >= danger_closing_speed
-        )
-
-        return {
-            "distance": distance,
-            "closing_speed": closing_speed,
-            "los_xy": los_xy,
-            "away_xy": -los_xy,
-            "left_beam_xy": self._rotate_vector(los_xy, np.pi / 2),
-            "right_beam_xy": self._rotate_vector(los_xy, -np.pi / 2),
-            "dangerous": dangerous,
-        }
-
-    def _mix_tactical_vectors(self, primary, secondary, primary_weight):
-        primary_vector = self._safe_unit_vector(primary)
-        secondary_vector = self._safe_unit_vector(secondary, fallback=primary_vector)
-        return primary_vector * primary_weight + secondary_vector * (1.0 - primary_weight)
-
-    def _preferred_missile_beam(self, missile_geometry, ego_heading_xy):
-        left_score = np.dot(ego_heading_xy, missile_geometry["left_beam_xy"])
-        right_score = np.dot(ego_heading_xy, missile_geometry["right_beam_xy"])
-        return missile_geometry["left_beam_xy"] if left_score >= right_score else missile_geometry["right_beam_xy"]
-
-    def _missile_aware_action_to_delta_control(self, env, agent_id, action_id, missile_geometry):
-        geometry = self._combat_geometry(env, agent_id)
-        relative_xy = geometry["relative_xy"]
-        ego_heading_xy = geometry["ego_heading_xy"]
-        distance_xy = geometry["distance_xy"]
-        preferred_beam_xy = self._preferred_missile_beam(missile_geometry, ego_heading_xy)
-        close_threat_distance = getattr(self.config, "tactical_missile_close_distance", 3500.0)
-        close_threat = missile_geometry["distance"] <= close_threat_distance
-
-        delta_altitude = 0.0
-        delta_velocity = 0.0
-
-        if action_id in (self.PURE_PURSUIT, self.LEAD_PURSUIT, self.LAG_PURSUIT):
-            # 来袭导弹较近时，追击类动作改为带横切角的 crank，避免持续正对敌机暴露。
-            beam_weight = 0.8 if close_threat else 0.6
-            target_xy = self._mix_tactical_vectors(preferred_beam_xy, relative_xy, beam_weight)
-            delta_altitude = self._altitude_step_to_enemy(env, agent_id)
-            delta_velocity = 0.0 if close_threat else 0.05
-        elif action_id == self.DISENGAGE:
-            # 脱离动作优先远离来袭导弹，同时保留少量当前航向惯性。
-            target_xy = self._mix_tactical_vectors(missile_geometry["away_xy"], ego_heading_xy, 0.85)
-            delta_velocity = 0.05
-        elif action_id == self.CLIMB_POSITION:
-            target_xy = self._mix_tactical_vectors(preferred_beam_xy, relative_xy, 0.7)
-            delta_altitude = 0.1
-        elif action_id == self.DIVE_ACCELERATE:
-            target_xy = self._mix_tactical_vectors(missile_geometry["away_xy"], preferred_beam_xy, 0.75)
-            delta_altitude = -0.1
-            delta_velocity = 0.05
-        elif action_id == self.LEVEL_ACCELERATE:
-            target_xy = self._mix_tactical_vectors(missile_geometry["away_xy"], preferred_beam_xy, 0.6)
-            delta_velocity = 0.05
-        elif action_id == self.LEVEL_DECELERATE:
-            # 导弹威胁下不主动减速，保留能量做横切。
-            target_xy = preferred_beam_xy
-        elif action_id == self.DEFENSIVE_TURN_LEFT:
-            # 左/右防御转弯改为相对导弹视线的 beam/notch。
-            target_xy = missile_geometry["left_beam_xy"]
-            delta_velocity = 0.05
-        elif action_id == self.DEFENSIVE_TURN_RIGHT:
-            target_xy = missile_geometry["right_beam_xy"]
-            delta_velocity = 0.05
-        elif action_id == self.HIGH_YOYO:
-            target_xy = self._mix_tactical_vectors(preferred_beam_xy, relative_xy, 0.65)
-            delta_altitude = 0.1
-        elif action_id == self.LOW_YOYO:
-            target_xy = self._mix_tactical_vectors(preferred_beam_xy, missile_geometry["away_xy"], 0.55)
-            delta_altitude = -0.1
-            delta_velocity = 0.05
-        else:
-            raise ValueError(f"Unknown tactical action id: {action_id}")
-
-        delta_altitude, delta_velocity = self._apply_tactical_safety(
-            env, agent_id, action_id, delta_altitude, delta_velocity, distance_xy
-        )
-        delta_heading = self._quantize_heading_error(self._heading_error_to_vector(env, agent_id, target_xy))
-        return np.array([delta_altitude, delta_heading, delta_velocity], dtype=np.float32)
-
-    def _tactical_action_to_delta_control(self, env, agent_id, action_id):
-        missile_geometry = self._incoming_missile_geometry(env, agent_id)
-        if missile_geometry is None or not missile_geometry["dangerous"]:
-            return TacticalHierarchicalSingleCombatTask._tactical_action_to_delta_control(
-                self, env, agent_id, action_id
-            )
-        return self._missile_aware_action_to_delta_control(env, agent_id, action_id, missile_geometry)
 
     def normalize_action(self, env, agent_id, action):
         """将战术动作和发射标志转换为低层飞控动作。"""

@@ -44,6 +44,11 @@ max_attack_angle: 45        # unit: degree
 max_attack_distance: 14000  # unit: m
 min_attack_interval: 125     # unit: step
 
+# tactical missile-aware translation config
+tactical_missile_danger_distance: 9000.0
+tactical_missile_close_distance: 3500.0
+tactical_missile_danger_closing_speed: 150.0
+
 # (lontitude, latitude, altitude)
 battle_field_center: [120.0, 60.0, 0.0]
 

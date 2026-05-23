@@ -11,6 +11,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 from envs.JSBSim.envs.singlecontrol_env import SingleControlEnv
 from envs.JSBSim.envs.singlecombat_env import SingleCombatEnv
 from envs.JSBSim.envs.multiplecombat_env import MultipleCombatEnv
+from envs.JSBSim.tasks.singlecombat_task import TacticalHierarchicalSingleCombatTask
 from envs.env_wrappers import DummyVecEnv, SubprocVecEnv, ShareDummyVecEnv, ShareSubprocVecEnv
 
 
@@ -194,6 +195,47 @@ class TestSingleCombatEnv:
             assert np.allclose(rewards, rew_buf[t])
             assert np.all(dones == done_buf[t])
         env.close()
+
+    def test_tactical_dodge_uses_missile_aware_action_translation(self, monkeypatch):
+        env = SingleCombatEnv("1v1/DodgeMissile/TacticalHierarchySelfplay")
+        try:
+            env.seed(0)
+            env.reset()
+            agent_id = (env.ego_ids + env.enm_ids)[0]
+            agent = env.agents[agent_id]
+
+            action_id = env.task.LEVEL_ACCELERATE
+            base_delta = TacticalHierarchicalSingleCombatTask._tactical_action_to_delta_control(
+                env.task, env, agent_id, action_id
+            )
+            monkeypatch.setattr(agent, "check_missile_warning", lambda: None)
+            fallback_delta = env.task._tactical_action_to_delta_control(env, agent_id, action_id)
+            assert np.allclose(fallback_delta, base_delta)
+
+            class FakeMissile:
+                def __init__(self, position, velocity):
+                    self.position = position
+                    self.velocity = velocity
+
+                def get_position(self):
+                    return self.position
+
+                def get_velocity(self):
+                    return self.velocity
+
+            ego_position = agent.get_position()
+            ego_heading = env.task._ego_heading_vector(env, agent_id)
+            missile_position = ego_position + np.array([ego_heading[0], ego_heading[1], 0.0]) * 1000.0
+            missile_velocity = np.array([-ego_heading[0], -ego_heading[1], 0.0]) * 600.0
+            fake_missile = FakeMissile(missile_position, missile_velocity)
+            monkeypatch.setattr(agent, "check_missile_warning", lambda: fake_missile)
+
+            missile_delta = env.task._tactical_action_to_delta_control(env, agent_id, action_id)
+            assert missile_delta.shape == (3,)
+            assert np.any(np.isclose(missile_delta[1], env.task.norm_delta_heading))
+            assert not np.allclose(missile_delta, base_delta)
+        finally:
+            env.close()
 
     def test_shoot_missile_respects_launch_window(self):
         env = SingleCombatEnv("1v1/ShootMissile/Selfplay")

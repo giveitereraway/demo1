@@ -71,22 +71,22 @@ except Exception as exc:
 # 可修改实验配置
 # =========================
 
-EXPERIMENT_NAME = "tacticalshoot_A_vs_hierarchyshootselfB"
+EXPERIMENT_NAME = "tactical_2A_vs_selfB"
 
 # 评估环境必须使用直接控制版 SingleCombat 场景。
-EVAL_SCENARIO_NAME = "1v1/ShootMissile/Selfplay"
+EVAL_SCENARIO_NAME = "1v1/NoWeapon/Selfplay"
 
 # 两个 actor 可以来自不同训练场景；脚本会按各自场景构造网络动作空间。
-ACTOR_A_PATH = REPO_ROOT / "scripts/results/SingleCombat/1v1/ShootMissile/TacticalHierarchySelfplay/ppo/1v1_tactical_hierarchy_shoot/wandb/run-20260518_181854-v6y70b6o/files/actor_latest.pt"
-ACTOR_A_SCENARIO_NAME = "1v1/ShootMissile/TacticalHierarchySelfplay"
+ACTOR_A_PATH = REPO_ROOT / "scripts/results/SingleCombat/1v1/NoWeapon/TacticalHierarchySelfplay/ppo/1v1_tactical_hierarchy_2/wandb/offline-run-20260516_131027-v6k42xjz/files/actor_latest.pt"
+ACTOR_A_SCENARIO_NAME = "1v1/NoWeapon/TacticalHierarchySelfplay"
 
-ACTOR_B_PATH = REPO_ROOT / "scripts/results/SingleCombat/1v1/ShootMissile/HierarchySelfplay/ppo/1v1_shoot_hierarchy/wandb/offline-run-20260515_160545-s6vfbap6/files/actor_latest.pt"
-ACTOR_B_SCENARIO_NAME = "1v1/ShootMissile/HierarchySelfplay"
+ACTOR_B_PATH = REPO_ROOT / "scripts/results/SingleCombat/1v1/NoWeapon/Selfplay/ppo/1v1_follow/wandb/offline-run-20260512_175151-yryla8wg/files/actor_latest.pt"
+ACTOR_B_SCENARIO_NAME = "1v1/NoWeapon/Selfplay"
 
 # 分层 actor 的低层控制器。
 LOWLEVEL_ACTOR_PATH = REPO_ROOT / "envs/JSBSim/model/actor_heading.pt"
 
-NUM_EPISODES = 20
+NUM_EPISODES = 500
 SEED = 1
 DEVICE = "cuda:0"  # auto / cpu / cuda:0
 DETERMINISTIC = True
