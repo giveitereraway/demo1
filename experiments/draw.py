@@ -29,6 +29,8 @@ except Exception as exc:  # pragma: no cover - 只有绘图库环境损坏时触
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_RESULT_ROOT = REPO_ROOT / "experiments" / "outputs"
+# N局滑动平均的默认窗口；手动改这里即可改变不传 --window 时的曲线平滑程度。
+DEFAULT_MOVING_AVERAGE_WINDOW = 20
 
 ACTOR_A_COLOR = "#C44E52"
 ACTOR_B_COLOR = "#4C72B0"
@@ -765,7 +767,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--result-root", default=str(DEFAULT_RESULT_ROOT), help="批量扫描的实验输出根目录。")
     parser.add_argument("--all", action="store_true", help="扫描 result-root 下所有实验目录并生成跨实验对比图。")
     parser.add_argument("--output-dir", default=None, help="图片输出目录；默认写入 paper_figures/。")
-    parser.add_argument("--window", type=int, default=5, help="滑动平均窗口大小。")
+    parser.add_argument("--window", type=int, default=DEFAULT_MOVING_AVERAGE_WINDOW, help="滑动平均窗口大小。")
     parser.add_argument("--dpi", type=int, default=300, help="图片导出 DPI。")
     parser.add_argument("--formats", type=parse_formats, default=parse_formats("png,pdf"), help="导出格式，逗号分隔，例如 png,pdf。")
     return parser

@@ -45,8 +45,8 @@ class PostureReward(BaseRewardFunction):
             orientation_reward = self.orientation_fn(AO, TA)
             range_reward = self.range_fn(R / 1000)
 
-            proximity_bonus = 1.5 if R / 1000 < self.target_dist * 0.8 else 1.0 # 添加近距离额外奖励
-            new_reward += orientation_reward * range_reward * proximity_bonus
+            #proximity_bonus = 1.5 if R / 1000 < self.target_dist * 0.8 else 1.0 # 添加近距离额外奖励
+            #new_reward += orientation_reward * range_reward * proximity_bonus
 
             new_reward += orientation_reward * range_reward
         return self._process(new_reward, agent_id, (orientation_reward, range_reward))
@@ -71,12 +71,12 @@ class PostureReward(BaseRewardFunction):
             return lambda R: np.clip(1.2 * np.min([np.exp(-(R - self.target_dist) * 0.21), 1]) /
                                      (1. + np.exp(-(R - self.target_dist + 1) * 0.8)), 0.3, 1)
         elif version == 'v2':
-            """return lambda R: max(np.clip(1.2 * np.min([np.exp(-(R - self.target_dist) * 0.21), 1]) /
-                                         (1. + np.exp(-(R - self.target_dist + 1) * 0.8)), 0.3, 1), np.sign(7 - R))"""
-            return lambda R: max(np.clip(1.5 * np.min([np.exp(-(R - self.target_dist) * 0.5), 1]) /
-                                         (1. + np.exp(-(R - self.target_dist + 0.5) * 1.6)), 0.3, 1.5), np.sign(0.5 - R))
+            return lambda R: max(np.clip(1.2 * np.min([np.exp(-(R - self.target_dist) * 0.21), 1]) /
+                                         (1. + np.exp(-(R - self.target_dist + 1) * 0.8)), 0.3, 1), np.sign(7 - R))
+            """return lambda R: max(np.clip(1.5 * np.min([np.exp(-(R - self.target_dist) * 0.5), 1]) /
+                                         (1. + np.exp(-(R - self.target_dist + 0.5) * 1.6)), 0.3, 1.5), np.sign(0.5 - R))"""
         elif version == 'v3':
-            """#return lambda R: 1 * (R < 5) + (R >= 5) * np.clip(-0.032 * R**2 + 0.284 * R + 0.38, 0, 1) + np.clip(np.exp(-0.16 * R), 0, 0.2)"""
-            return lambda R: 1.2 * (R < 0.5) + (R >= 0.5) * np.clip(-1 * R**2 + 0.9 * R + 0.7975, 0, 1) + np.clip(np.exp(-0.16 * R), 0, 0.2)
+            return lambda R: 1 * (R < 5) + (R >= 5) * np.clip(-0.032 * R**2 + 0.284 * R + 0.38, 0, 1) + np.clip(np.exp(-0.16 * R), 0, 0.2)
+            """return lambda R: 1.2 * (R < 0.5) + (R >= 0.5) * np.clip(-1 * R**2 + 0.9 * R + 0.7975, 0, 1) + np.clip(np.exp(-0.16 * R), 0, 0.2)"""
         else:
             raise NotImplementedError(f"Unknown range function version: {version}")

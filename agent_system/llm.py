@@ -4,7 +4,7 @@ import json
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Any, Iterable, Mapping
 
 from .settings import AgentSettings
 
@@ -28,6 +28,8 @@ class SiliconFlowClient:
         *,
         temperature: float = 0.2,
         max_tokens: int = 2048,
+        enable_thinking: bool | None = None,
+        extra_body: Mapping[str, Any] | None = None,
     ) -> str:
         if not self.settings.has_llm_credentials:
             raise RuntimeError("缺少 SILICONFLOW_API_KEY，无法调用硅基流动模型。")
@@ -42,6 +44,12 @@ class SiliconFlowClient:
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
+        if enable_thinking is not None:
+            # 硅基流动的 Qwen 推理模型会把内容放进 reasoning_content；
+            # 结构化 JSON 解析场景需要关闭 thinking，避免 message.content 为空。
+            payload["enable_thinking"] = enable_thinking
+        if extra_body:
+            payload.update(extra_body)
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         url = f"{self.settings.siliconflow_base_url.rstrip('/')}/chat/completions"
         request = urllib.request.Request(

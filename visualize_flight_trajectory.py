@@ -54,6 +54,9 @@ def parse_flight_data(file_path: str) -> Dict[str, Dict[str, List]]:
                 continue
                 
             aircraft_id = parts[0]
+            # ACMI 中以 F 结尾的对象通常是爆炸事件，不作为飞行轨迹绘制
+            if aircraft_id.endswith('F'):
+                continue
             
             # 解析位置和姿态数据
             if not parts[1].startswith('T='):
@@ -101,6 +104,22 @@ def parse_flight_data(file_path: str) -> Dict[str, Dict[str, List]]:
     return flight_data
 
 
+def is_missile_object(name: str) -> bool:
+    """判断当前对象是否为导弹。"""
+    return name.upper().startswith('AIM')
+
+
+def get_display_label(aircraft_id: str, name: str) -> str:
+    """把 ACMI 对象 ID 转换为图例中更易读的名称。"""
+    if is_missile_object(name):
+        return '导弹'
+    if aircraft_id == 'A0100':
+        return 'Actor A'
+    if aircraft_id == 'B0100':
+        return 'Actor B'
+    return aircraft_id
+
+
 def plot_3d_trajectory(flight_data: Dict[str, Dict[str, List]], output_file: str = None):
     """
     绘制三维飞行轨迹图
@@ -112,6 +131,7 @@ def plot_3d_trajectory(flight_data: Dict[str, Dict[str, List]], output_file: str
     # 创建3D图形
     fig = plt.figure(figsize=(14, 10))
     ax = fig.add_subplot(111, projection='3d')
+    missile_label_added = False
     
     # 为每架飞机绘制轨迹
     for aircraft_id, data in flight_data.items():
@@ -120,12 +140,33 @@ def plot_3d_trajectory(flight_data: Dict[str, Dict[str, List]], output_file: str
         altitude = np.array(data['altitude'])
         color = data['color']
         name = data['name']
+        display_label = get_display_label(aircraft_id, name)
+        
+        if is_missile_object(name):
+            # 导弹使用虚线轨迹和三角形标记，图例只统一显示一次
+            ax.plot(longitude, latitude, altitude,
+                    color=color,
+                    linewidth=1.5,
+                    linestyle='--',
+                    alpha=0.5,
+                    label='_nolegend_')
+            step = max(1, len(longitude) // 15)
+            ax.scatter(longitude[::step], latitude[::step], altitude[::step],
+                       color=color,
+                       s=45,
+                       marker='>',
+                       edgecolors='black',
+                       linewidths=0.5,
+                       alpha=0.8,
+                       label=display_label if not missile_label_added else '_nolegend_')
+            missile_label_added = True
+            continue
         
         # 绘制轨迹线
         ax.plot(longitude, latitude, altitude, 
                 color=color, 
                 linewidth=2, 
-                label=f"{aircraft_id} ({name}) - {color.capitalize()}",
+                label=f"{display_label} ({name}) - {color.capitalize()}",
                 alpha=0.7)
         
         # 绘制起点（大圆点）
@@ -135,7 +176,7 @@ def plot_3d_trajectory(flight_data: Dict[str, Dict[str, List]], output_file: str
                   marker='o', 
                   edgecolors='black',
                   linewidths=2,
-                  label=f"{aircraft_id} 起点")
+                  label=f"{display_label} 起点")
         
         # 绘制终点（五角星）
         ax.scatter(longitude[-1], latitude[-1], altitude[-1], 
@@ -144,7 +185,7 @@ def plot_3d_trajectory(flight_data: Dict[str, Dict[str, List]], output_file: str
                   marker='*', 
                   edgecolors='black',
                   linewidths=2,
-                  label=f"{aircraft_id} 终点")
+                  label=f"{display_label} 终点")
         
         # 沿轨迹绘制质点标记（每隔一定间隔）
         step = max(1, len(longitude) // 20)  # 最多显示20个标记点
@@ -209,7 +250,7 @@ def print_flight_summary(flight_data: Dict[str, Dict[str, List]]):
 def main():
     """主函数"""
     # 数据文件路径
-    data_file = 'hierarchy1_follow_hierarchy2.txt.acmi'
+    data_file = 'experiments\\results\\tacticalshoot_2A_vs_shootselfB_20260525_130151\\acmi/episode_0000.txt.acmi'
     
     print("开始解析飞行轨迹数据...")
     
