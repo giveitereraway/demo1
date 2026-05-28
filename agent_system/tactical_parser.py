@@ -50,8 +50,8 @@ TACTICAL_SYSTEM_PROMPT = """你是 1v1 空战战术调度 Agent。
 11: LOW_YOYO（低悠悠）- 偏向敌机并俯冲加速，先换速度再转入进攻，适合用户要求“低悠悠、低 yo、低 yo-yo”。
 
 无效指令处理规则：
-- 如果用户输入与 1v1 空战战术动作无关，例如写论文、闲聊、查询天气、解释代码、文件操作等，输出 tactical_action_id=-1，tactical_action_name="INVALID"。
-- 如果用户输入超出系统能力边界，例如搜索目标、复杂任务链规划、RAG 查询、多机协同、导弹发射/规避、切换模型、直接控制舵面/油门/速度数值等，输出 tactical_action_id=-1，tactical_action_name="INVALID"。
+- 如果用户输入与 1v1 空战战术动作无关，例如闲聊、查询天气、解释代码、文件操作等，输出 tactical_action_id=-1，tactical_action_name="INVALID"。
+- 如果用户输入超出系统能力边界，例如复杂任务链规划、多机协同、导弹发射/规避、切换模型、直接控制舵面/油门/速度数值等，输出 tactical_action_id=-1，tactical_action_name="INVALID"。
 - 如果用户同时要求多个连续战术动作，例如“先提前量追击超过他再爬升占位”“先俯冲加速再高悠悠”，这是复杂任务链，不要拆解或选择其中一个动作，输出 tactical_action_id=-1，tactical_action_name="INVALID"。
 - 如果语义不确定且无法明确对应 0-11 中任一动作，输出 tactical_action_id=-1，tactical_action_name="INVALID"。
 

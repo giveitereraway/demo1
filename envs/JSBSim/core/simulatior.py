@@ -448,6 +448,9 @@ class MissileSimulator(BaseSimulator):
         self.target_aircraft.under_missiles.append(self)
 
     def run(self):
+        # 导弹一旦命中或失效，就保持终态，避免后续仿真子步把 HIT 覆盖成 MISS。
+        if self.is_done:
+            return
         self._t += self.dt
         action, distance = self._guidance()
         self._distance_increment.append(distance > self._distance_pre)

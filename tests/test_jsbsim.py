@@ -7,10 +7,13 @@ import gymnasium as gym
 import numpy as np
 from pathlib import Path
 from itertools import product
+from types import SimpleNamespace
 sys.path.append(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 from envs.JSBSim.envs.singlecontrol_env import SingleControlEnv
 from envs.JSBSim.envs.singlecombat_env import SingleCombatEnv
 from envs.JSBSim.envs.multiplecombat_env import MultipleCombatEnv
+from envs.JSBSim.core.simulatior import MissileSimulator
+from envs.JSBSim.reward_functions.event_driven_reward import EventDrivenReward
 from envs.JSBSim.tasks.singlecombat_task import TacticalHierarchicalSingleCombatTask
 from envs.env_wrappers import DummyVecEnv, SubprocVecEnv, ShareDummyVecEnv, ShareSubprocVecEnv
 
@@ -267,6 +270,67 @@ class TestSingleCombatEnv:
                 assert len(env.agents[agent_id].launch_missiles) == before_launched[agent_id]
         finally:
             env.close()
+
+    def test_missile_hit_state_persists_for_stats_and_event_reward(self, monkeypatch):
+        class FakeAircraft:
+            def __init__(self, uid, color, position):
+                self.uid = uid
+                self.color = color
+                self.dt = 1 / 60
+                self.lon0, self.lat0, self.alt0 = 120.0, 60.0, 0.0
+                self.launch_missiles = []
+                self.under_missiles = []
+                self._position = np.asarray(position, dtype=np.float64)
+                self._velocity = np.array([300.0, 0.0, 0.0], dtype=np.float64)
+                self._posture = np.zeros(3)
+                self._shotdown = False
+                self._crash = False
+
+            @property
+            def is_alive(self):
+                return not self._shotdown and not self._crash
+
+            @property
+            def is_shotdown(self):
+                return self._shotdown
+
+            @property
+            def is_crash(self):
+                return self._crash
+
+            def shotdown(self):
+                self._shotdown = True
+
+            def get_geodetic(self):
+                return np.array([120.0, 60.0, 6000.0], dtype=np.float64)
+
+            def get_position(self):
+                return self._position
+
+            def get_velocity(self):
+                return self._velocity
+
+            def get_rpy(self):
+                return self._posture
+
+        parent = FakeAircraft("A0100", "Red", [0.0, 0.0, 6000.0])
+        target = FakeAircraft("B0100", "Blue", [0.0, 0.0, 6000.0])
+        missile = MissileSimulator.create(parent=parent, target=target, uid="A01002")
+        monkeypatch.setattr(missile, "_guidance", lambda: (np.zeros(2), 0.0))
+        env = SimpleNamespace(agents={"A0100": parent, "B0100": target})
+        reward = EventDrivenReward(SimpleNamespace(EventDrivenReward_scale=1, EventDrivenReward_potential=True))
+        reward.reset(None, env)
+
+        # 命中后再次 run 也不能把 HIT 终态覆盖为 MISS，否则统计和事件奖励都会漏掉命中。
+        missile.run()
+        assert missile.is_success
+        assert target.is_shotdown
+        missile._t = missile._t_max + 1
+        missile.run()
+        assert missile.is_success
+
+        assert reward.get_reward(None, env, "A0100") == 200
+        assert reward.get_reward(None, env, "B0100") == -200
 
     @pytest.mark.parametrize("config", ["1v1/NoWeapon/vsBaseline", "1v1/NoWeapon/Selfplay"])
     def test_agent_crash(self, config):
