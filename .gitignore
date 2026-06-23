@@ -6,6 +6,10 @@ runs
 *.acmi
 output/
 outputs/
+tmp/
+*.pdf
+*.png
+*.jpg
 
 # vscode config
 .vscode
