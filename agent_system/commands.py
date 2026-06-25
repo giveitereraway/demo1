@@ -80,6 +80,8 @@ class TacticalDemoConfig:
     status_interval: int = 25
     verbose_steps: bool = False
     disable_llm: bool = False
+    disable_complex_plan: bool = False
+    max_plan_actions: int = 4
 
 
 def build_tactical_demo_command(config: TacticalDemoConfig) -> CommandSpec:
@@ -126,6 +128,8 @@ def build_tactical_demo_command(config: TacticalDemoConfig) -> CommandSpec:
         str(config.step_sleep),
         "--status-interval",
         str(config.status_interval),
+        "--max-plan-actions",
+        str(config.max_plan_actions),
     ]
     if config.enemy_action:
         command.extend(["--enemy-action", config.enemy_action])
@@ -133,6 +137,8 @@ def build_tactical_demo_command(config: TacticalDemoConfig) -> CommandSpec:
         command.append("--verbose-steps")
     if config.disable_llm:
         command.append("--disable-llm")
+    if config.disable_complex_plan:
+        command.append("--disable-complex-plan")
     return CommandSpec(
         "1v1 LLM-Agent 战术调度演示",
         command,

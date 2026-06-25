@@ -11,6 +11,9 @@ from agent_system.tactical_parser import (
     parse_tactical_instruction,
     parse_tactical_json,
 )
+from agent_system.tactical_plan_executor import TacticalPlanExecutor
+from agent_system.tactical_planner import parse_tactical_command
+from agent_system.tactical_state import TacticalSituation, situation_from_obs
 from agent_system.tactical_policy import resolve_actor_checkpoint_path
 from agent_system.tactical_safety import TacticalSafetyState, apply_tactical_safety
 from agent_system.tactical_scheduler import TacticalActionScheduler
@@ -43,6 +46,47 @@ def test_tactical_keyword_parser_maps_chinese_phrases() -> None:
     assert keyword_parse_tactical_instruction("向左防御转弯").action_id == 8
     assert not keyword_parse_tactical_instruction("先提前量追击超过他再爬升占位").valid
     assert not keyword_parse_tactical_instruction("先搜索目标再规划复杂任务").valid
+
+
+def test_tactical_situation_from_obs_extracts_risk_tags() -> None:
+    obs = [0.68, 0.0, 1.0, 0.0, 1.0, 0.9, 0.0, 0.0, 0.9, 0.0, -0.4, 2.5, 0.7, 0.1, 1.0]
+    situation = situation_from_obs(obs, altitude_limit_m=2500.0)
+
+    assert round(situation.altitude_m or 0.0, 3) == 3400.0
+    assert situation.speed_mps == 306.0
+    assert situation.delta_altitude_m == -400.0
+    assert situation.distance_m == 1000.0
+    assert situation.low_altitude_risk
+    assert situation.close_fast_risk
+    assert situation.bad_posture_risk
+    assert situation.has_altitude_advantage
+    assert situation.to_log()["side_label"] == "左侧"
+
+
+def test_tactical_keyword_parser_uses_situation_hints() -> None:
+    low = TacticalSituation(altitude_m=3200.0, altitude_limit_m=2500.0)
+    close_fast = TacticalSituation(distance_m=900.0, speed_mps=300.0)
+    bad_posture = TacticalSituation(ao_rad=2.6, ta_rad=0.5)
+
+    assert keyword_parse_tactical_instruction("高度太低，拉起来", situation=low).action_id == 4
+    assert keyword_parse_tactical_instruction("别冲过头", situation=close_fast).action_id == 7
+    assert keyword_parse_tactical_instruction("现在太被动，先保命", situation=bad_posture).action_id == 3
+    assert keyword_parse_tactical_instruction("速度不够，补能量").action_id == 6
+
+
+def test_tactical_complex_command_keyword_plan() -> None:
+    first = parse_tactical_command("先提前量追击超过他再爬升占位", client=None)
+    second = parse_tactical_command("先俯冲加速再高悠悠", client=None)
+    invalid = parse_tactical_command("先帮我写摘要再生成代码", client=None)
+
+    assert first.kind == "plan"
+    assert first.plan is not None
+    assert [step.action_id for step in first.plan.steps] == [1, 4]
+    assert [step.until for step in first.plan.steps] == ["range_close", "altitude_advantage"]
+    assert second.kind == "plan"
+    assert second.plan is not None
+    assert [step.action_id for step in second.plan.steps] == [5, 10]
+    assert invalid.kind == "invalid"
 
 
 def test_tactical_llm_json_validation() -> None:
@@ -162,6 +206,42 @@ def test_tactical_llm_invalid_decision_does_not_keyword_fallback() -> None:
     assert decision.tactical_action_name == "INVALID"
 
 
+def test_tactical_plan_executor_switches_then_returns_to_actor_fallback() -> None:
+    command = parse_tactical_command("先提前量追击超过他再爬升占位", client=None, default_min_steps=2, default_max_steps=4)
+    assert command.plan is not None
+    executor = TacticalPlanExecutor()
+    executor.start(command.plan)
+
+    far = TacticalSituation(distance_m=5000.0, delta_altitude_m=100.0)
+    close = TacticalSituation(distance_m=1500.0, delta_altitude_m=100.0)
+    high = TacticalSituation(distance_m=1500.0, delta_altitude_m=-500.0)
+
+    assert executor.select(far).action_id == 1
+    assert executor.select(far).action_id == 1
+    switched = executor.select(close)
+    assert switched is not None
+    assert switched.action_id == 4
+    assert switched.plan_step_index == 2
+    assert executor.select(high).action_id == 4
+    assert executor.select(high) is None
+    assert not executor.active
+
+
+def test_tactical_plan_output_still_passes_safety_override() -> None:
+    command = parse_tactical_command("先俯冲加速再高悠悠", client=None, default_min_steps=1, default_max_steps=3)
+    assert command.plan is not None
+    executor = TacticalPlanExecutor()
+    executor.start(command.plan)
+    low = TacticalSituation(altitude_m=3200.0, altitude_limit_m=2500.0)
+
+    selected = executor.select(low)
+    assert selected is not None
+    assert selected.action_id == 5
+    safety = apply_tactical_safety(selected.action_id, state=low.to_safety_state(), fallback_action_id=0)
+    assert safety.action_id == 4
+    assert safety.overridden
+
+
 def test_tactical_scheduler_uses_actor_fallback_then_manual_hold() -> None:
     scheduler = TacticalActionScheduler(hold_steps=2)
     first = scheduler.select(actor_action_id=6)
@@ -213,6 +293,7 @@ def test_build_tactical_demo_command_uses_default_actor_and_enemy_paths() -> Non
     assert "--render-mode" in spec.command
     assert "none" in spec.command
     assert "--status-interval" in spec.command
+    assert "--max-plan-actions" in spec.command
     assert "--step-sleep" in spec.command
     assert "--disable-llm" in spec.command
     assert spec.validation_errors == []
@@ -241,6 +322,13 @@ def test_build_tactical_demo_command_uses_default_actor_and_enemy_paths() -> Non
         TacticalDemoConfig(enemy_action="NOT_A_TACTIC", render_mode="none")
     )
     assert any("enemy-action" in item for item in invalid_enemy_action.validation_errors)
+
+    complex_disabled = build_tactical_demo_command(
+        TacticalDemoConfig(disable_complex_plan=True, max_plan_actions=3, render_mode="none")
+    )
+    assert "--disable-complex-plan" in complex_disabled.command
+    assert "--max-plan-actions" in complex_disabled.command
+    assert "3" in complex_disabled.command
 
     missing = build_tactical_demo_command(TacticalDemoConfig(actor_path="missing_actor.pt"))
     assert any("Tactical actor 文件不存在" in item for item in missing.validation_errors)

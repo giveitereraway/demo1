@@ -13,6 +13,7 @@ from .tactical_actions import (
     action_name_matches,
     coerce_action_id,
 )
+from .tactical_state import TacticalSituation
 
 
 @dataclass(frozen=True)
@@ -171,13 +172,67 @@ def _looks_like_complex_task_chain(normalized_text: str) -> bool:
     return len(_matched_action_ids(normalized_text)) >= 2
 
 
-def keyword_parse_tactical_instruction(user_input: str, *, agent_id: str = "A0100") -> TacticalDecision:
+def _state_hint_decision(user_input: str, *, agent_id: str, situation: TacticalSituation | None) -> TacticalDecision | None:
+    normalized = user_input.lower()
+    situation_reason = f" {situation.to_prompt_text()}" if situation is not None else ""
+    if any(term in normalized for term in ("低空", "太低", "高度低", "高度太低", "拉起来", "别撞地")):
+        return TacticalDecision(
+            action_id=4,
+            tactical_action_name=action_name(4),
+            reason=f"状态相关指令指向低空改出/爬升需求，选择爬升占位。{situation_reason}",
+            agent_id=agent_id,
+            source="keyword_state",
+            raw_text=user_input,
+            valid=True,
+        )
+    if any(term in normalized for term in ("距离太近", "贴太近", "快冲过头", "快过冲", "接近率太大", "过冲风险")):
+        if situation is None or situation.close_fast_risk:
+            return TacticalDecision(
+                action_id=7,
+                tactical_action_name=action_name(7),
+                reason=f"状态相关指令指向近距高速过冲风险，选择平飞减速。{situation_reason}",
+                agent_id=agent_id,
+                source="keyword_state",
+                raw_text=user_input,
+                valid=True,
+            )
+    if any(term in normalized for term in ("姿态不利", "被动", "先保命", "危险姿态", "角度不利", "态势不利")):
+        if situation is None or situation.bad_posture_risk:
+            return TacticalDecision(
+                action_id=3,
+                tactical_action_name=action_name(3),
+                reason=f"状态相关指令指向不利姿态下先重整态势，选择脱离。{situation_reason}",
+                agent_id=agent_id,
+                source="keyword_state",
+                raw_text=user_input,
+                valid=True,
+            )
+    if any(term in normalized for term in ("速度不够", "能量不足", "空速不够", "速度太低", "补能量")):
+        return TacticalDecision(
+            action_id=6,
+            tactical_action_name=action_name(6),
+            reason=f"状态相关指令指向速度/能量不足，选择平飞加速。{situation_reason}",
+            agent_id=agent_id,
+            source="keyword_state",
+            raw_text=user_input,
+            valid=True,
+        )
+    return None
+
+
+def keyword_parse_tactical_instruction(
+    user_input: str,
+    *,
+    agent_id: str = "A0100",
+    situation: TacticalSituation | None = None,
+    allow_complex: bool = True,
+) -> TacticalDecision:
     text = user_input.strip()
     if not text:
         return TacticalDecision.invalid("输入为空。", source="keyword", raw_text=user_input, agent_id=agent_id)
 
     normalized = text.lower()
-    if _looks_like_complex_task_chain(normalized):
+    if allow_complex and _looks_like_complex_task_chain(normalized):
         return TacticalDecision.invalid("检测到多步复杂任务链，当前版本只支持单个高层战术动作。", source="keyword", raw_text=user_input, agent_id=agent_id)
 
     scored: list[tuple[int, TacticalDecision]] = []
@@ -199,9 +254,30 @@ def keyword_parse_tactical_instruction(user_input: str, *, agent_id: str = "A010
                     )
                 )
     if scored:
+        matched_ids = {item[1].action_id for item in scored}
+        if (
+            situation is not None
+            and situation.close_fast_risk
+            and matched_ids
+            and matched_ids.issubset({2, 7})
+            and any(term in normalized for term in ("别冲过头", "避免冲过头", "冲过头", "过冲"))
+        ):
+            return TacticalDecision(
+                action_id=7,
+                tactical_action_name=action_name(7),
+                reason=f"当前存在近距高速过冲风险，过冲相关指令优先解释为平飞减速。 {situation.to_prompt_text()}",
+                agent_id=agent_id,
+                source="keyword_state",
+                raw_text=user_input,
+                valid=True,
+            )
         # 优先使用最长关键词，避免“加速俯冲”被普通“加速”抢先匹配。
         scored.sort(key=lambda item: item[0], reverse=True)
         return scored[0][1]
+
+    state_hint = _state_hint_decision(user_input, agent_id=agent_id, situation=situation)
+    if state_hint is not None:
+        return state_hint
 
     return TacticalDecision.invalid("未识别到支持的战术意图。", source="keyword", raw_text=user_input, agent_id=agent_id)
 
@@ -211,6 +287,7 @@ def parse_tactical_instruction(
     *,
     client: SiliconFlowClient | None = None,
     agent_id: str = "A0100",
+    situation: TacticalSituation | None = None,
 ) -> TacticalDecision:
     if not user_input.strip():
         return TacticalDecision.invalid("输入为空。", source="manual", raw_text=user_input, agent_id=agent_id)
@@ -220,11 +297,12 @@ def parse_tactical_instruction(
             f"{item.action_id}: {item.code}（{item.chinese_name}）- {item.description}"
             for item in TACTICAL_ACTIONS
         )
+        situation_text = situation.to_prompt_text() if situation is not None else "当前态势摘要：未提供。"
         try:
             content = client.chat(
                 [
                     LLMMessage("system", TACTICAL_SYSTEM_PROMPT),
-                    LLMMessage("user", f"可选战术动作如下：\n{action_table}\n\n用户指令：{user_input}"),
+                    LLMMessage("user", f"可选战术动作如下：\n{action_table}\n\n{situation_text}\n\n用户指令：{user_input}"),
                 ],
                 temperature=0.0,
                 max_tokens=512,
@@ -235,7 +313,7 @@ def parse_tactical_instruction(
                 return decision
             if decision.tactical_action_name == "INVALID":
                 return decision
-            fallback = keyword_parse_tactical_instruction(user_input, agent_id=agent_id)
+            fallback = keyword_parse_tactical_instruction(user_input, agent_id=agent_id, situation=situation)
             if fallback.valid:
                 return TacticalDecision(
                     action_id=fallback.action_id,
@@ -249,7 +327,7 @@ def parse_tactical_instruction(
             return decision
         except Exception as exc:
             # LLM 不可用时继续走关键词，保证演示脚本离线可跑。
-            fallback = keyword_parse_tactical_instruction(user_input, agent_id=agent_id)
+            fallback = keyword_parse_tactical_instruction(user_input, agent_id=agent_id, situation=situation)
             if fallback.valid:
                 return TacticalDecision(
                     action_id=fallback.action_id,
@@ -262,7 +340,7 @@ def parse_tactical_instruction(
                 )
             return TacticalDecision.invalid(f"LLM 解析失败且关键词未识别: {exc}", source="llm", raw_text=user_input, agent_id=agent_id)
 
-    return keyword_parse_tactical_instruction(user_input, agent_id=agent_id)
+    return keyword_parse_tactical_instruction(user_input, agent_id=agent_id, situation=situation)
 
 
 def decision_to_log(decision: TacticalDecision) -> dict[str, object]:

@@ -23,10 +23,13 @@ if str(REPO_ROOT) not in sys.path:
 from agent_system.llm import SiliconFlowClient
 from agent_system.settings import AgentSettings, DEFAULT_TACTICAL_ACTOR_PATH
 from agent_system.tactical_actions import ACTION_BY_ID, action_chinese_name, action_name, parse_action_reference
-from agent_system.tactical_parser import TacticalDecision, decision_to_log, parse_tactical_instruction
+from agent_system.tactical_parser import TacticalDecision, decision_to_log
+from agent_system.tactical_plan_executor import PlanExecutionResult, TacticalPlanExecutor
+from agent_system.tactical_planner import parse_tactical_command
 from agent_system.tactical_policy import TacticalActorPolicy, resolve_actor_checkpoint_path
-from agent_system.tactical_safety import apply_tactical_safety, state_from_env
-from agent_system.tactical_scheduler import TacticalActionScheduler
+from agent_system.tactical_safety import apply_tactical_safety
+from agent_system.tactical_scheduler import ScheduledTacticalAction, TacticalActionScheduler
+from agent_system.tactical_state import situation_from_env
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -55,6 +58,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--status-interval", type=int, default=0, help="终端状态打印间隔；0 表示只在人工指令或安全覆盖时打印。")
     parser.add_argument("--verbose-steps", action="store_true", help="每个仿真步都打印状态，主要用于调试。")
     parser.add_argument("--disable-llm", action="store_true", help="只使用关键词解析，不调用 LLM。")
+    parser.add_argument("--disable-complex-plan", action="store_true", help="关闭复杂指令多步计划，只保留单动作解析。")
+    parser.add_argument("--max-plan-actions", type=int, default=4, help="复杂指令最多拆解出的战术动作数量。")
     return parser
 
 
@@ -162,6 +167,7 @@ def main(argv: list[str] | None = None) -> int:
     policy = TacticalActorPolicy.load(actor_path, env, device_name=args.device)
     enemy_policy = None if fixed_enemy_action_id is not None else TacticalActorPolicy.load(enemy_path, env, device_name=args.device)
     scheduler = TacticalActionScheduler(hold_steps=args.hold_steps)
+    plan_executor = TacticalPlanExecutor()
     input_queue = start_input_thread()
     client = make_client(args.disable_llm)
     tacview = None
@@ -173,6 +179,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print("1v1 LLM-Agent tactical demo started.")
     print("输入中文战术短句后回车可临时接管；直接不输入时使用 actor fallback。输入 quit/exit/退出 结束。")
+    print("复杂指令会被解析为有限多步战术计划；每一步仍是 0-11 的高层 tactical action。")
     print("终端默认低频打印状态，完整逐步记录写入 JSONL 日志；如需逐步刷屏可加 --verbose-steps。")
     print(f"actor: {actor_path}")
     if fixed_enemy_action_id is None:
@@ -210,25 +217,44 @@ def main(argv: list[str] | None = None) -> int:
                     "enemy_fixed_action_id": fixed_enemy_action_id,
                     "enemy_fixed_action_name": action_name(fixed_enemy_action_id) if fixed_enemy_action_id is not None else "",
                     "hold_steps": args.hold_steps,
+                    "disable_complex_plan": args.disable_complex_plan,
+                    "max_plan_actions": args.max_plan_actions,
                     "status_interval": args.status_interval,
                     "verbose_steps": args.verbose_steps,
                 },
             )
 
             while env.current_step < args.max_steps and not bool(np.asarray(dones).all()):
+                situation = situation_from_env(env, args.agent_id)
                 raw_instruction = drain_latest_instruction(input_queue)
                 if raw_instruction is not None and raw_instruction.strip().lower() in {"quit", "exit", "q", "退出", "结束"}:
                     break
 
                 manual_decision: TacticalDecision | None = None
+                parsed_command_kind = "none"
+                parsed_plan_log: dict[str, object] | None = None
                 if raw_instruction is not None and raw_instruction.strip():
-                    manual_decision = parse_tactical_instruction(
+                    command = parse_tactical_command(
                         raw_instruction,
                         client=client,
                         agent_id=args.agent_id,
+                        situation=situation,
+                        enable_complex_plan=not args.disable_complex_plan,
+                        max_plan_actions=args.max_plan_actions,
+                        default_min_steps=3,
+                        default_max_steps=args.hold_steps,
                     )
-                    if not manual_decision.valid:
-                        print(f"[manual ignored] {raw_instruction}: {manual_decision.reason}")
+                    parsed_command_kind = command.kind
+                    if command.kind == "plan" and command.plan is not None:
+                        scheduler.clear_manual()
+                        plan_executor.start(command.plan)
+                        parsed_plan_log = command.plan.to_log()
+                        print(f"[manual plan] {raw_instruction}: {command.reason}")
+                    elif command.kind == "decision" and command.decision is not None and command.decision.valid:
+                        plan_executor.clear()
+                        manual_decision = command.decision
+                    else:
+                        print(f"[manual ignored] {raw_instruction}: {command.reason}")
 
                 actor_action_id = policy.act(obs[agent_index])
                 if fixed_enemy_action_id is None:
@@ -239,11 +265,22 @@ def main(argv: list[str] | None = None) -> int:
                 else:
                     enemy_action_id = fixed_enemy_action_id
                     enemy_source = "fixed_action"
-                scheduled = scheduler.select(actor_action_id=actor_action_id, manual_decision=manual_decision)
-                state = state_from_env(env, args.agent_id)
+
+                plan_result: PlanExecutionResult | None = plan_executor.select(situation)
+                if plan_result is not None:
+                    scheduled = ScheduledTacticalAction(
+                        action_id=plan_result.action_id,
+                        source=plan_result.source,
+                        reason=plan_result.reason,
+                        remaining_manual_steps=0,
+                        actor_action_id=actor_action_id,
+                        manual_action_id=plan_result.action_id,
+                    )
+                else:
+                    scheduled = scheduler.select(actor_action_id=actor_action_id, manual_decision=manual_decision)
                 safety = apply_tactical_safety(
                     scheduled.action_id,
-                    state=state,
+                    state=situation.to_safety_state(),
                     fallback_action_id=last_safe_action_id,
                 )
                 last_safe_action_id = safety.action_id
@@ -265,7 +302,9 @@ def main(argv: list[str] | None = None) -> int:
                     "event": "step",
                     "step": int(env.current_step),
                     "source": scheduled.source,
+                    "command_kind": parsed_command_kind,
                     "instruction": raw_instruction or "",
+                    "situation": situation.to_log(),
                     "actor_action_id": actor_action_id,
                     "actor_action_name": action_name(actor_action_id),
                     "enemy_source": enemy_source,
@@ -280,27 +319,46 @@ def main(argv: list[str] | None = None) -> int:
                     "safety_overridden": safety.overridden,
                     "safety_reason": safety.reason,
                     "remaining_manual_steps": scheduled.remaining_manual_steps,
+                    "plan_active": plan_executor.active,
+                    "plan_id": plan_result.plan_id if plan_result is not None else "",
+                    "plan_step_index": plan_result.plan_step_index if plan_result is not None else 0,
+                    "plan_total_steps": plan_result.plan_total_steps if plan_result is not None else 0,
+                    "plan_until": plan_result.plan_until if plan_result is not None else "",
+                    "plan_status": plan_result.plan_status if plan_result is not None else plan_executor.last_status,
                     "reward": np.asarray(rewards).reshape(-1).astype(float).tolist(),
                     "done": np.asarray(dones).reshape(-1).astype(bool).tolist(),
                 }
                 if manual_decision is not None:
                     log_payload["manual_decision"] = decision_to_log(manual_decision)
+                if parsed_plan_log is not None:
+                    log_payload["manual_plan"] = parsed_plan_log
                 write_log(log_file, log_payload)
 
                 if should_print_status(
                     step=int(env.current_step),
                     status_interval=args.status_interval,
                     verbose_steps=args.verbose_steps,
-                    had_instruction=manual_decision is not None,
+                    had_instruction=manual_decision is not None or raw_instruction is not None or plan_result is not None,
                     safety_overridden=safety.overridden,
                 ):
-                    print(
-                        f"[step {env.current_step:04d}] source={scheduled.source} "
-                        f"action={safety.action_id}:{ACTION_BY_ID[safety.action_id].chinese_name} "
-                        f"actor={actor_action_id}:{ACTION_BY_ID[actor_action_id].chinese_name} "
-                        f"enemy={enemy_action_id}:{ACTION_BY_ID[enemy_action_id].chinese_name}({enemy_source})"
-                        + (f" override={safety.reason}" if safety.overridden else "")
-                    )
+                    if plan_result is not None:
+                        print(
+                            f"[step {env.current_step:04d}] source=manual_plan "
+                            f"step={plan_result.plan_step_index}/{plan_result.plan_total_steps} "
+                            f"action={safety.action_id}:{ACTION_BY_ID[safety.action_id].chinese_name} "
+                            f"until={plan_result.plan_until} "
+                            f"actor={actor_action_id}:{ACTION_BY_ID[actor_action_id].chinese_name} "
+                            f"enemy={enemy_action_id}:{ACTION_BY_ID[enemy_action_id].chinese_name}({enemy_source})"
+                            + (f" override={safety.reason}" if safety.overridden else "")
+                        )
+                    else:
+                        print(
+                            f"[step {env.current_step:04d}] source={scheduled.source} "
+                            f"action={safety.action_id}:{ACTION_BY_ID[safety.action_id].chinese_name} "
+                            f"actor={actor_action_id}:{ACTION_BY_ID[actor_action_id].chinese_name} "
+                            f"enemy={enemy_action_id}:{ACTION_BY_ID[enemy_action_id].chinese_name}({enemy_source})"
+                            + (f" override={safety.reason}" if safety.overridden else "")
+                        )
 
                 if args.step_sleep > 0:
                     time.sleep(args.step_sleep)

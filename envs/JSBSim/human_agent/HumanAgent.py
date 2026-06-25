@@ -81,7 +81,7 @@ class HumanAgent(BaseAgent):
                 info_win.clear()
 
                 # 设置一个适当的超时时间，单位是毫秒，例如 500 毫秒
-                stdscr.timeout(500)         # 设置 stdscr 的超时时间为 500 毫秒。如果在 500 毫秒内没有键盘输入，则返回key为 -1，从而避免程序阻塞。
+                stdscr.timeout(100)         # 设置 stdscr 的超时时间为 500 毫秒。如果在 500 毫秒内没有键盘输入，则返回key为 -1，从而避免程序阻塞。
 
 
                 key = stdscr.getch()        # 读取用户按下的键。
@@ -89,7 +89,7 @@ class HumanAgent(BaseAgent):
                 self.update_action(key)     # 更新动作
                 
                 # 限制处理速度，避免过快刷新
-                time.sleep(0.05)
+                #time.sleep(0.05)
 
                 # 刷新窗口
                 self.refresh_windows(control_win, info_win)
@@ -100,14 +100,14 @@ class HumanAgent(BaseAgent):
     def update_action(self, key):
         # 左右控制横滚角
         if key == ord('a') and self.aileron < 40:
-            self.aileron -= 1
+            self.aileron -= 5
         elif key == ord('d') and self.aileron > 0:
-            self.aileron += 1
+            self.aileron += 5
         # 上下控制俯仰角
         elif key == ord('w') and self.elevator > 0:
-            self.elevator += 1
+            self.elevator += 10
         elif key == ord('s') and self.elevator < 40:
-            self.elevator -= 1
+            self.elevator -= 10
         # 控制其他操作
         elif key == ord('z') and self.rudder > 0:
             self.rudder -= 1
