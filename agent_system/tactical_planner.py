@@ -18,6 +18,12 @@ from .tactical_state import TacticalSituation
 TACTICAL_PLAN_SYSTEM_PROMPT = """你是 1v1 空战战术计划 Agent。
 你的任务是把用户的复杂自然语言战术指令拆解成 2 到 4 个有限高层战术步骤。每个步骤必须是 TacticalHierarchySelfplay 已支持的 12 类 tactical action id 之一。
 
+动作编号固定为：
+0=PURE_PURSUIT（纯追击），1=LEAD_PURSUIT（提前量追击），2=LAG_PURSUIT（滞后追击），3=DISENGAGE（脱离），
+4=CLIMB_POSITION（爬升占位），5=DIVE_ACCELERATE（俯冲加速），6=LEVEL_ACCELERATE（平飞加速），
+7=LEVEL_DECELERATE（平飞减速），8=DEFENSIVE_TURN_LEFT（左防御转弯），9=DEFENSIVE_TURN_RIGHT（右防御转弯），
+10=HIGH_YOYO（高悠悠），11=LOW_YOYO（低悠悠）。
+
 硬性边界：
 - 只能输出 0-11 的高层战术动作，不能输出舵面、油门、俯仰角、滚转角、航向角或连续速度数值。
 - 不处理多机协同、导弹发射/规避、模型切换、RAG 查询、文件操作或论文写作等无关任务。
@@ -265,7 +271,6 @@ def parse_tactical_command(
         return TacticalCommand.from_decision(decision)
 
     if client is not None:
-        action_table = "\n".join(f"{item.action_id}: {item.code}（{item.chinese_name}）- {item.description}" for item in TACTICAL_ACTIONS)
         situation_text = situation.to_prompt_text() if situation is not None else "当前态势摘要：未提供。"
         try:
             content = client.chat(
@@ -273,11 +278,11 @@ def parse_tactical_command(
                     LLMMessage("system", TACTICAL_PLAN_SYSTEM_PROMPT),
                     LLMMessage(
                         "user",
-                        f"可选战术动作如下：\n{action_table}\n\n{situation_text}\n\n用户复杂指令：{text}",
+                        f"{situation_text}\n\n用户复杂指令：{text}",
                     ),
                 ],
                 temperature=0.0,
-                max_tokens=900,
+                max_tokens=512,
                 enable_thinking=False,
             )
             command = parse_tactical_plan_json(

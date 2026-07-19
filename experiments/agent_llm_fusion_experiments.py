@@ -23,6 +23,9 @@ Agent/LLM 融合实验脚本
     --manual-schedule  时间轴实验的人工指令注入计划，默认包含一条简单指令和一条双动作复杂指令。
     --max-steps        时间轴实验最大环境步数。
     --hold-steps       每条人工指令接管的环境步数。
+    --llm-request-interval  LLM 请求最小间隔秒数，默认 3.0，用于降低 TPM 峰值。
+    --llm-max-retries       遇到 HTTP 429 时最大重试次数，默认 5。
+    --llm-retry-backoff     429 指数退避初始秒数，默认 15.0，单次等待最长 60 秒。
     --formats          图片格式，默认 png,pdf。
     --no-plots         只输出 CSV/JSON，不生成图片。
 
@@ -84,7 +87,7 @@ from agent_system.tactical_scheduler import ScheduledTacticalAction, TacticalAct
 from agent_system.tactical_state import TacticalSituation, situation_from_env
 
 
-DEFAULT_MANUAL_SCHEDULE = "30:向左转弯;90:减速;150:先提前量追击接近敌机，再爬升占位"
+DEFAULT_MANUAL_SCHEDULE = "30:减速;90:向左转弯;150:先提前量追击接近敌机，再爬升占位"
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "experiments" / "outputs" / "agent_llm_fusion"
 FIGURE_DPI = 180
 LLM_FALLBACK_REPEAT_COUNT = 3
@@ -681,11 +684,26 @@ def build_instruction_dataset() -> list[InstructionCase]:
     )
 
 
-def make_llm_client(parser_mode: str) -> SiliconFlowClient | None:
+def make_llm_client(
+    parser_mode: str,
+    *,
+    request_interval: float = 0.0,
+    max_retries: int = 2,
+    retry_backoff: float = 5.0,
+) -> SiliconFlowClient | None:
     if parser_mode != "llm_fallback":
         return None
     settings = AgentSettings.load()
-    return SiliconFlowClient(settings) if settings.has_llm_credentials else None
+    return (
+        SiliconFlowClient(
+            settings,
+            min_request_interval=request_interval,
+            max_retries=max_retries,
+            retry_backoff_seconds=retry_backoff,
+        )
+        if settings.has_llm_credentials
+        else None
+    )
 
 
 PARSING_SOURCE_DISPLAY_NAMES = {
@@ -742,8 +760,13 @@ def evaluate_instruction_cases(
     parser_mode: str,
     agent_id: str,
     include_state_context: bool = True,
+    client: SiliconFlowClient | None = None,
+    client_supplied: bool = False,
+    progress_label: str = "",
+    progress_every: int = 30,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    client = make_llm_client(parser_mode)
+    if not client_supplied:
+        client = make_llm_client(parser_mode)
     llm_client_available = client is not None
     llm_attempted = parser_mode == "llm_fallback" and llm_client_available
     repeat_count = LLM_FALLBACK_REPEAT_COUNT if parser_mode == "llm_fallback" else 1
@@ -791,6 +814,9 @@ def evaluate_instruction_cases(
                     "note": case.note,
                 }
             )
+            expected_row_count = len(cases) * repeat_count
+            if progress_label and (len(rows) % max(1, progress_every) == 0 or len(rows) == expected_row_count):
+                print(f"[parse:{progress_label}] 已完成 {len(rows)}/{expected_row_count}", flush=True)
 
     total = len(rows)
     valid_count = sum(1 for row in rows if row["valid"])
@@ -972,13 +998,37 @@ def plot_instruction_results(rows: Sequence[dict[str, Any]], summary: dict[str, 
 def run_parse_experiment(args: argparse.Namespace, output_root: Path) -> None:
     output_dir = output_root / "parse"
     cases = build_instruction_dataset()
-    rows, summary = evaluate_instruction_cases(cases, parser_mode=args.parser_mode, agent_id=args.agent_id)
     state_cases = build_state_aware_instruction_dataset()
+    client = make_llm_client(
+        args.parser_mode,
+        request_interval=args.llm_request_interval,
+        max_retries=args.llm_max_retries,
+        retry_backoff=args.llm_retry_backoff,
+    )
+    if client is not None:
+        total_requests = (len(cases) + len(state_cases)) * LLM_FALLBACK_REPEAT_COUNT
+        minimum_minutes = max(0.0, (total_requests - 1) * args.llm_request_interval / 60.0)
+        print(
+            f"[parse] 已启用 TPM 限流保护：共 {total_requests} 次逻辑请求，"
+            f"最小间隔 {args.llm_request_interval:.1f}s，预计至少 {minimum_minutes:.1f} 分钟。",
+            flush=True,
+        )
+    rows, summary = evaluate_instruction_cases(
+        cases,
+        parser_mode=args.parser_mode,
+        agent_id=args.agent_id,
+        client=client,
+        client_supplied=True,
+        progress_label="主数据集",
+    )
     no_context_rows, no_context_summary = evaluate_instruction_cases(
         state_cases,
         parser_mode=args.parser_mode,
         agent_id=args.agent_id,
         include_state_context=False,
+        client=client,
+        client_supplied=True,
+        progress_label="无态势摘要消融",
     )
     with_context_rows = [dict(row, ablation_mode="with_context") for row in rows if row["category"] == "state_aware"]
     no_context_rows = [dict(row, ablation_mode="without_context") for row in no_context_rows]
@@ -993,6 +1043,7 @@ def run_parse_experiment(args: argparse.Namespace, output_root: Path) -> None:
         "without_context_correct": without_context_summary["correct"],
         "without_context_accuracy": without_context_summary["accuracy"],
     }
+    summary["llm_transport"] = client.metrics() if client is not None else {}
     write_csv(output_dir / "instruction_parsing_results.csv", rows)
     write_csv(output_dir / "state_context_ablation_results.csv", with_context_rows + no_context_rows)
     write_json(output_dir / "instruction_parsing_summary.json", summary)
@@ -1005,6 +1056,15 @@ def run_parse_experiment(args: argparse.Namespace, output_root: Path) -> None:
             print("[parse] 警告: 已尝试调用 LLM，但没有样本由 LLM 成功解析，请查看 CSV 的 reason 字段。")
         elif summary["keyword_fallback_count"] > 0:
             print(f"[parse] 提示: {summary['keyword_fallback_count']} 条样本 LLM 失败后使用关键词兜底。")
+        if client is not None:
+            transport = client.metrics()
+            print(
+                f"[parse] LLM 请求统计: 成功 {transport['successful_response_count']}/"
+                f"{transport['logical_request_count']}，429={transport['rate_limit_response_count']}，"
+                f"自动重试={transport['retry_count']}，最终请求间隔="
+                f"{transport['effective_request_interval']:.1f}s。",
+                flush=True,
+            )
     print(f"[parse] 输出目录: {output_dir}")
 
 
@@ -1057,7 +1117,12 @@ def run_timeline_experiment(args: argparse.Namespace, output_root: Path) -> None
 
     actor_path = resolve_actor_checkpoint_path(args.actor_path)
     enemy_path = resolve_actor_checkpoint_path(args.enemy_path or args.actor_path)
-    client = make_llm_client(args.parser_mode)
+    client = make_llm_client(
+        args.parser_mode,
+        request_interval=args.llm_request_interval,
+        max_retries=args.llm_max_retries,
+        retry_backoff=args.llm_retry_backoff,
+    )
 
     env = SingleCombatEnv(args.scenario_name)
     env.seed(args.seed)
@@ -1523,6 +1588,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--manual-schedule", default=DEFAULT_MANUAL_SCHEDULE)
     parser.add_argument("--max-steps", type=int, default=200)
     parser.add_argument("--hold-steps", type=int, default=10)
+    parser.add_argument(
+        "--llm-request-interval",
+        type=float,
+        default=3.0,
+        help="LLM 请求最小间隔秒数；调大可进一步降低 TPM 峰值。",
+    )
+    parser.add_argument("--llm-max-retries", type=int, default=5, help="HTTP 429 最大自动重试次数。")
+    parser.add_argument("--llm-retry-backoff", type=float, default=15.0, help="HTTP 429 指数退避初始秒数。")
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--scenario-name", default="1v1/NoWeapon/TacticalHierarchySelfplay")
@@ -1556,6 +1629,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             "manual_schedule": args.manual_schedule,
             "max_steps": args.max_steps,
             "hold_steps": args.hold_steps,
+            "llm_request_interval": args.llm_request_interval,
+            "llm_max_retries": args.llm_max_retries,
+            "llm_retry_backoff": args.llm_retry_backoff,
             "seed": args.seed,
             "device": args.device,
             "scenario_name": args.scenario_name,

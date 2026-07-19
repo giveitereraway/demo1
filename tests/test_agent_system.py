@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import io
 import json
+import urllib.error
 
 from agent_system.commands import TacticalDemoConfig, _path, build_tactical_demo_command
+from agent_system.llm import LLMMessage, SiliconFlowClient
 from agent_system.settings import AgentSettings, DEFAULT_TACTICAL_ACTOR_PATH, REPO_ROOT
 from agent_system.tactical_actions import ACTION_BY_ID, action_name_matches
 from agent_system.tactical_parser import (
@@ -170,8 +173,10 @@ def test_tactical_llm_parser_disables_thinking_for_json() -> None:
     class FakeClient:
         def __init__(self) -> None:
             self.kwargs = {}
+            self.messages = []
 
         def chat(self, messages, **kwargs):
+            self.messages = list(messages)
             self.kwargs = kwargs
             return json.dumps(
                 {
@@ -191,6 +196,49 @@ def test_tactical_llm_parser_disables_thinking_for_json() -> None:
     assert decision.source == "llm"
     assert decision.action_id == 4
     assert client.kwargs["enable_thinking"] is False
+    assert "可选战术动作如下" not in client.messages[-1].content
+
+
+def test_siliconflow_client_retries_rate_limit(monkeypatch) -> None:
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return False
+
+        def read(self) -> bytes:
+            return json.dumps({"choices": [{"message": {"content": "ok"}}]}).encode("utf-8")
+
+    responses = [
+        urllib.error.HTTPError(
+            "https://api.siliconflow.cn/v1/chat/completions",
+            429,
+            "rate limited",
+            {"Retry-After": "0"},
+            io.BytesIO(b'{"message":"TPM limit reached"}'),
+        ),
+        FakeResponse(),
+    ]
+
+    def fake_urlopen(request, timeout):
+        response = responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    monkeypatch.setattr("agent_system.llm.urllib.request.urlopen", fake_urlopen)
+    client = SiliconFlowClient(
+        AgentSettings(siliconflow_api_key="test-key"),
+        max_retries=1,
+        retry_backoff_seconds=0.0,
+    )
+
+    assert client.chat([LLMMessage("user", "测试")]) == "ok"
+    assert client.metrics()["request_attempt_count"] == 2
+    assert client.metrics()["rate_limit_response_count"] == 1
+    assert client.metrics()["retry_count"] == 1
+    assert client.metrics()["effective_request_interval"] == 1.0
 
 
 def test_tactical_llm_invalid_decision_does_not_keyword_fallback() -> None:
@@ -485,6 +533,13 @@ def test_agent_llm_experiment_llm_mode_repeats_each_case(monkeypatch) -> None:
     assert summary["base_case_total"] == 1
     assert summary["repeat_count"] == 3
     assert {row["repeat_index"] for row in rows} == {1, 2, 3}
+
+
+def test_agent_llm_experiment_enables_default_rate_limit_protection() -> None:
+    args = fusion_experiments.build_arg_parser().parse_args(["--experiment", "parse"])
+    assert args.llm_request_interval == 3.0
+    assert args.llm_max_retries == 5
+    assert args.llm_retry_backoff == 15.0
 
 
 def test_agent_llm_experiment_safety_cases_cover_reasons() -> None:

@@ -293,19 +293,15 @@ def parse_tactical_instruction(
         return TacticalDecision.invalid("输入为空。", source="manual", raw_text=user_input, agent_id=agent_id)
 
     if client is not None:
-        action_table = "\n".join(
-            f"{item.action_id}: {item.code}（{item.chinese_name}）- {item.description}"
-            for item in TACTICAL_ACTIONS
-        )
         situation_text = situation.to_prompt_text() if situation is not None else "当前态势摘要：未提供。"
         try:
             content = client.chat(
                 [
                     LLMMessage("system", TACTICAL_SYSTEM_PROMPT),
-                    LLMMessage("user", f"可选战术动作如下：\n{action_table}\n\n{situation_text}\n\n用户指令：{user_input}"),
+                    LLMMessage("user", f"{situation_text}\n\n用户指令：{user_input}"),
                 ],
                 temperature=0.0,
-                max_tokens=512,
+                max_tokens=256,
                 enable_thinking=False,
             )
             decision = parse_tactical_json(content, agent_id=agent_id)
