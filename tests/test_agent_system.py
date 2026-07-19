@@ -19,10 +19,18 @@ from agent_system.tactical_safety import TacticalSafetyState, apply_tactical_saf
 from agent_system.tactical_scheduler import TacticalActionScheduler
 from experiments import agent_llm_fusion_experiments as fusion_experiments
 from experiments.agent_llm_fusion_experiments import (
+    DEFAULT_MANUAL_SCHEDULE,
+    SAFETY_REASON_DISPLAY_NAMES,
+    build_base_instruction_dataset,
+    build_complex_instruction_dataset,
     build_instruction_dataset,
+    build_invalid_instruction_dataset,
     build_safety_cases,
+    build_state_aware_instruction_dataset,
     evaluate_safety_cases,
     parse_manual_schedule,
+    parsing_source_display,
+    timeline_source_display_counts,
 )
 
 
@@ -346,37 +354,130 @@ def test_agent_llm_experiment_manual_schedule_parser() -> None:
         150: "向左防御转弯",
     }
     assert parse_manual_schedule("") == {}
+    assert parse_manual_schedule(DEFAULT_MANUAL_SCHEDULE) == {
+        30: "减速",
+        90: "向左转弯",
+        150: "先提前量追击接近敌机，再爬升占位",
+    }
 
 
 def test_agent_llm_experiment_dataset_covers_12_actions() -> None:
     cases = build_instruction_dataset()
-    expected_ids = {case.expected_action_id for case in cases if case.expected_action_id >= 0}
-    invalid_cases = [case for case in cases if case.expected_action_id == -1]
+    base_cases = build_base_instruction_dataset()
+    state_cases = build_state_aware_instruction_dataset()
+    complex_cases = build_complex_instruction_dataset()
+    invalid_cases = build_invalid_instruction_dataset()
+    expected_ids = {case.expected_action_id for case in base_cases if case.expected_action_id is not None}
+
+    assert len(cases) == 194
+    assert len(base_cases) == 120
+    assert len(state_cases) == 30
+    assert len(complex_cases) == 24
+    assert len(invalid_cases) == 20
     assert expected_ids == set(ACTION_BY_ID)
-    assert len(invalid_cases) == 6
 
     for action_id in ACTION_BY_ID:
-        action_cases = [case for case in cases if case.expected_action_id == action_id]
+        action_cases = [case for case in base_cases if case.expected_action_id == action_id]
         assert len(action_cases) == 10
         assert any(any(ch.isascii() and ch.isalpha() for ch in case.instruction) for case in action_cases)
+
+    assert {case.expected_action_id for case in state_cases} == {3, 4, 7}
+    assert all(case.situation is not None for case in state_cases)
+    assert all(len(case.expected_actions) == 2 for case in complex_cases)
+    complex_action_counts = {
+        action_id: sum(case.expected_actions.count(action_id) for case in complex_cases)
+        for action_id in ACTION_BY_ID
+    }
+    assert min(complex_action_counts.values()) >= 2
+    assert all(case.expected_kind == "invalid" for case in invalid_cases)
 
 
 def test_agent_llm_experiment_keyword_dataset_is_unambiguous() -> None:
     rows, summary = fusion_experiments.evaluate_instruction_cases(
-        build_instruction_dataset(),
+        build_base_instruction_dataset(),
         parser_mode="keyword",
         agent_id="A0100",
     )
-    assert summary["base_case_total"] == 126
+    assert summary["base_case_total"] == 120
     assert summary["repeat_count"] == 1
     assert summary["correct_count"] == summary["total"]
     assert [row for row in rows if not row["correct"]] == []
 
 
+def test_agent_llm_experiment_complex_keyword_plans_match_two_actions() -> None:
+    rows, summary = fusion_experiments.evaluate_instruction_cases(
+        build_complex_instruction_dataset(),
+        parser_mode="keyword",
+        agent_id="A0100",
+    )
+    assert summary["category_summaries"]["complex_plan"]["total"] == 24
+    assert all(row["predicted_kind"] == "plan" for row in rows)
+    assert all(row["correct"] for row in rows)
+
+
+def test_agent_llm_experiment_state_context_ablation_is_paired() -> None:
+    cases = build_state_aware_instruction_dataset()
+    prompts = {case.instruction for case in cases}
+    assert len(prompts) == 10
+    for prompt in prompts:
+        prompt_cases = [case for case in cases if case.instruction == prompt]
+        assert len(prompt_cases) == 3
+        assert {case.expected_action_id for case in prompt_cases} == {3, 4, 7}
+
+    with_context_rows, _ = fusion_experiments.evaluate_instruction_cases(
+        cases[:3],
+        parser_mode="keyword",
+        agent_id="A0100",
+        include_state_context=True,
+    )
+    without_context_rows, _ = fusion_experiments.evaluate_instruction_cases(
+        cases[:3],
+        parser_mode="keyword",
+        agent_id="A0100",
+        include_state_context=False,
+    )
+    assert all(row["situation"] for row in with_context_rows)
+    assert all(not row["situation"] for row in without_context_rows)
+
+
+def test_agent_llm_experiment_uses_chinese_display_labels() -> None:
+    assert parsing_source_display("llm") == "LLM解析"
+    assert parsing_source_display("llm_plan") == "LLM解析"
+    assert parsing_source_display("keyword") == "关键词兜底"
+    assert parsing_source_display("keyword_plan") == "关键词兜底"
+    assert timeline_source_display_counts(
+        [{"source": "actor_fallback"}, {"source": "manual"}, {"source": "manual_plan"}]
+    ) == {"自主决策": 1, "人类指令": 2}
+    assert SAFETY_REASON_DISPLAY_NAMES == {
+        "none": "安全动作",
+        "invalid_action": "非法动作",
+        "low_altitude": "低空",
+        "close_fast": "近距高速",
+        "bad_posture": "不利姿态",
+        "other": "其他",
+    }
+
+
+def test_agent_llm_experiment_timeline_merges_safety_override_ranges() -> None:
+    rows = [
+        {"step": 66, "safety_overridden": False},
+        {"step": 67, "safety_overridden": True},
+        {"step": 68, "safety_overridden": "True"},
+        {"step": 69, "safety_overridden": False},
+        {"step": 208, "safety_overridden": True},
+        {"step": 209, "safety_overridden": True},
+    ]
+    ranges = fusion_experiments._timeline_step_ranges(
+        rows,
+        lambda row: fusion_experiments._timeline_flag_is_true(row["safety_overridden"]),
+    )
+    assert ranges == [(67, 68), (208, 209)]
+
+
 def test_agent_llm_experiment_llm_mode_repeats_each_case(monkeypatch) -> None:
     monkeypatch.setattr(fusion_experiments, "make_llm_client", lambda parser_mode: None)
     rows, summary = fusion_experiments.evaluate_instruction_cases(
-        build_instruction_dataset()[:1],
+        build_base_instruction_dataset()[:1],
         parser_mode="llm_fallback",
         agent_id="A0100",
     )
@@ -396,6 +497,7 @@ def test_agent_llm_experiment_safety_cases_cover_reasons() -> None:
     assert summary["total"] == 50
     assert {"low_altitude", "close_fast", "bad_posture", "invalid_action", "none"}.issubset(categories)
     assert summary["overridden_count"] >= 20
+    assert set(summary["reason_display_counts"]).issubset(set(SAFETY_REASON_DISPLAY_NAMES.values()))
     assert by_case["low_dive_at_margin"]["final_action_id"] == 4
     assert by_case["low_dive_above_margin"]["overridden"] is False
     assert by_case["close_fast_pure_at_distance"]["final_action_id"] == 7
