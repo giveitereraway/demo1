@@ -3,23 +3,24 @@
 Agent/LLM 融合实验脚本
 
 本脚本用于生成论文中 Agent/LLM 融合部分的实验数据和图表，包含三组实验：
-1. 指令解析准确率实验：验证中文/英文战术指令能否被映射到 12 类 tactical action；每类内置 10 条表达。
-2. manual 接管 + actor fallback 时间轴实验：验证有人工指令时临时接管，无指令时恢复 RL actor。
+1. 指令解析准确率实验：保留 12 类动作各 10 条表达，新增 30 条态势感知、24 条双动作计划和 20 条越界指令。
+2. manual 接管 + actor fallback 时间轴实验：验证简单指令、双动作计划接管以及无指令时恢复 RL actor。
 3. 安全覆盖实验：验证低空、近距高速、不利姿态和非法动作会被安全模块拦截。
 
 最小运行命令：
-    python experiments/agent_llm_fusion_experiments.py --experiment parse --parser-mode keyword
+    python experiments/agent_llm_fusion_experiments.py --experiment parse --parser-mode llm_fallback
     python experiments/agent_llm_fusion_experiments.py --experiment safety
     python experiments/agent_llm_fusion_experiments.py --experiment timeline --max-steps 200 --device auto
-    python experiments/agent_llm_fusion_experiments.py --experiment all --max-steps 200 --parser-mode keyword
+    python experiments/agent_llm_fusion_experiments.py --experiment all --max-steps 300 --parser-mode llm_fallback
 
 主要参数说明：
     --experiment       选择实验：parse / timeline / safety / all，默认 all。
     --parser-mode      指令解析方式：keyword 只用关键词；llm_fallback 有 API Key 时先用 LLM，失败后关键词兜底，且每条表达重复测试 3 遍。
+                       态势感知样本会额外隐藏态势摘要再运行一遍，用于配对消融对比。
     --actor-path       己方 tactical actor 路径；可传 actor_latest.pt 或包含该文件的目录。
     --enemy-path       敌方 tactical actor 路径；不传时复用 --actor-path。
     --enemy-action     敌方固定战术动作；显式传入后优先于 --enemy-path。
-    --manual-schedule  时间轴实验的人工指令注入计划，格式如 "30:爬升占位;90:减速避免冲过头"。
+    --manual-schedule  时间轴实验的人工指令注入计划，默认包含一条简单指令和一条双动作复杂指令。
     --max-steps        时间轴实验最大环境步数。
     --hold-steps       每条人工指令接管的环境步数。
     --formats          图片格式，默认 png,pdf。
@@ -30,6 +31,7 @@ Agent/LLM 融合实验脚本
 
 主要输出文件：
     parse/instruction_parsing_results.csv
+    parse/state_context_ablation_results.csv
     parse/instruction_parsing_summary.json
     timeline/timeline_steps.csv
     timeline/timeline_summary.json
@@ -40,6 +42,7 @@ Agent/LLM 融合实验脚本
     parse/figures/parsing_accuracy_by_action.*
     parse/figures/parsing_confusion_matrix.*
     parse/figures/parsing_source_validity.*
+    parse/figures/parsing_state_context_comparison.*
     timeline/figures/timeline_actions.*
     timeline/figures/timeline_source_ratio.*
     safety/figures/safety_reason_counts.*
@@ -56,7 +59,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -73,12 +76,15 @@ from agent_system.tactical_actions import (
     parse_action_reference,
 )
 from agent_system.tactical_parser import TacticalDecision, keyword_parse_tactical_instruction, parse_tactical_instruction
+from agent_system.tactical_plan_executor import PlanExecutionResult, TacticalPlanExecutor
+from agent_system.tactical_planner import parse_tactical_command
 from agent_system.tactical_policy import TacticalActorPolicy, resolve_actor_checkpoint_path
-from agent_system.tactical_safety import TacticalSafetyState, apply_tactical_safety, state_from_env
-from agent_system.tactical_scheduler import TacticalActionScheduler
+from agent_system.tactical_safety import TacticalSafetyState, apply_tactical_safety
+from agent_system.tactical_scheduler import ScheduledTacticalAction, TacticalActionScheduler
+from agent_system.tactical_state import TacticalSituation, situation_from_env
 
 
-DEFAULT_MANUAL_SCHEDULE = "30:爬升占位;90:减速避免冲过头;150:向左防御转弯"
+DEFAULT_MANUAL_SCHEDULE = "30:向左转弯;90:减速;150:先提前量追击接近敌机，再爬升占位"
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "experiments" / "outputs" / "agent_llm_fusion"
 FIGURE_DPI = 180
 LLM_FALLBACK_REPEAT_COUNT = 3
@@ -87,8 +93,27 @@ LLM_FALLBACK_REPEAT_COUNT = 3
 @dataclass(frozen=True)
 class InstructionCase:
     instruction: str
-    expected_action_id: int
+    expected_action_id: int | None
     note: str = ""
+    category: str = "single_action"
+    situation: TacticalSituation | None = None
+    expected_action_ids: tuple[int, ...] = ()
+
+    @property
+    def expected_kind(self) -> str:
+        if self.category == "complex_plan":
+            return "plan"
+        if self.category == "invalid":
+            return "invalid"
+        return "decision"
+
+    @property
+    def expected_actions(self) -> tuple[int, ...]:
+        if self.expected_action_ids:
+            return self.expected_action_ids
+        if self.expected_action_id is None or self.expected_action_id < 0:
+            return ()
+        return (self.expected_action_id,)
 
 
 @dataclass(frozen=True)
@@ -301,6 +326,32 @@ def write_svg_matrix(path: Path, title: str, x_labels: Sequence[str], y_labels: 
     write_svg(path, width, height, "\n".join(parts))
 
 
+def _timeline_flag_is_true(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes"}
+
+
+def _timeline_step_ranges(
+    rows: Sequence[dict[str, Any]],
+    predicate: Callable[[dict[str, Any]], bool],
+) -> list[tuple[int, int]]:
+    """把满足条件的时间轴环境步合并成连续区间。"""
+    active_steps = [int(row["step"]) for row in rows if predicate(row)]
+    if not active_steps:
+        return []
+
+    ranges: list[tuple[int, int]] = []
+    start = previous = active_steps[0]
+    for step in active_steps[1:]:
+        if step != previous + 1:
+            ranges.append((start, previous))
+            start = step
+        previous = step
+    ranges.append((start, previous))
+    return ranges
+
+
 def write_svg_timeline(path: Path, rows: Sequence[dict[str, Any]]) -> None:
     width, height = 1100, 560
     left, right, top, bottom = 145, 40, 55, 55
@@ -320,28 +371,19 @@ def write_svg_timeline(path: Path, rows: Sequence[dict[str, Any]]) -> None:
         return top + plot_h - plot_h * action_id / 11
 
     parts = [
-        f'<text x="{width / 2}" y="30" text-anchor="middle" font-size="22" font-weight="600">manual 接管与 actor fallback 动作时间轴</text>',
+        f'<text x="{width / 2}" y="30" text-anchor="middle" font-size="22" font-weight="600">人类指令接管与自主决策动作时间轴</text>',
         f'<rect x="{left}" y="{top}" width="{plot_w}" height="{plot_h}" fill="#FAFAFA" stroke="#444"/>',
     ]
-    manual_started = False
-    span_start = None
-    previous_step = None
-    for row in rows:
-        current_step = int(row["step"])
-        is_manual = row["source"] == "manual"
-        if is_manual and not manual_started:
-            span_start = current_step
-            manual_started = True
-        if manual_started and not is_manual:
-            x1 = x_of(span_start or current_step)
-            x2 = x_of(previous_step or current_step)
-            parts.append(f'<rect x="{x1:.1f}" y="{top}" width="{max(x2 - x1, 1):.1f}" height="{plot_h}" fill="#F0C36D" opacity="0.28"/>')
-            manual_started = False
-            span_start = None
-        previous_step = current_step
-    if manual_started and span_start is not None:
-        x1 = x_of(span_start)
-        parts.append(f'<rect x="{x1:.1f}" y="{top}" width="{max(x_of(max_step) - x1, 1):.1f}" height="{plot_h}" fill="#F0C36D" opacity="0.28"/>')
+    manual_ranges = _timeline_step_ranges(rows, lambda row: row["source"] in {"manual", "manual_plan"})
+    safety_ranges = _timeline_step_ranges(rows, lambda row: _timeline_flag_is_true(row.get("safety_overridden")))
+    for start, end in manual_ranges:
+        x1 = x_of(start)
+        x2 = x_of(end)
+        parts.append(f'<rect x="{x1:.1f}" y="{top}" width="{max(x2 - x1, 1):.1f}" height="{plot_h}" fill="#F0C36D" opacity="0.28"/>')
+    for start, end in safety_ranges:
+        x1 = x_of(start)
+        x2 = x_of(end)
+        parts.append(f'<rect x="{x1:.1f}" y="{top}" width="{max(x2 - x1, 1):.1f}" height="{plot_h}" fill="#7A5195" opacity="0.18" stroke="#7A5195" stroke-width="1.2"/>')
 
     for action in TACTICAL_ACTIONS:
         y = y_of(action.action_id)
@@ -354,11 +396,15 @@ def write_svg_timeline(path: Path, rows: Sequence[dict[str, Any]]) -> None:
     parts.append(f'<polyline points="{final_points}" fill="none" stroke="#C44E52" stroke-width="2.2"/>')
     parts.append(f'<text x="{width - 250}" y="{top + 20}" font-size="13" fill="#4C72B0">蓝线：actor 建议动作</text>')
     parts.append(f'<text x="{width - 250}" y="{top + 42}" font-size="13" fill="#C44E52">红线：最终执行动作</text>')
+    parts.append(f'<rect x="{width - 250}" y="{top + 52}" width="14" height="10" fill="#F0C36D" opacity="0.45"/>')
+    parts.append(f'<text x="{width - 230}" y="{top + 62}" font-size="13">人类指令接管</text>')
+    parts.append(f'<rect x="{width - 250}" y="{top + 74}" width="14" height="10" fill="#7A5195" opacity="0.35" stroke="#7A5195"/>')
+    parts.append(f'<text x="{width - 230}" y="{top + 84}" font-size="13">安全覆盖区间</text>')
     parts.append(f'<text x="{left + plot_w / 2}" y="{height - 15}" text-anchor="middle" font-size="13">环境步</text>')
     write_svg(path, width, height, "\n".join(parts))
 
 
-def build_instruction_dataset() -> list[InstructionCase]:
+def build_base_instruction_dataset() -> list[InstructionCase]:
     return [
         InstructionCase("直接追击敌机", 0),
         InstructionCase("咬住敌机继续追", 0),
@@ -480,23 +526,159 @@ def build_instruction_dataset() -> list[InstructionCase]:
         InstructionCase("压一个低悠悠再切回来", 11),
         InstructionCase("来个低 yo-yo 抢回能量", 11),
         InstructionCase("low yo-yo", 11),
-        #InstructionCase("先提前量追击超过他再爬升占位", -1, "复杂任务链，第一版不支持，用于统计无效处理"),
-        #InstructionCase("先纯追咬住目标，然后左防御转弯规避", -1, "复杂任务链，第一版不支持，用于统计无效处理"),
-        #InstructionCase("先滞后追击稳住角度，接着低悠悠抢能量", -1, "复杂任务链，第一版不支持，用于统计无效处理"),
-        #InstructionCase("先俯冲加速接近，再高悠悠控制过冲", -1, "复杂任务链，第一版不支持，用于统计无效处理"),
-        #InstructionCase("先平飞加速追上去，然后减速避免冲过头", -1, "复杂任务链，第一版不支持，用于统计无效处理"),
-        #InstructionCase("先向右防御转弯，再脱离当前交战", -1, "复杂任务链，第一版不支持，用于统计无效处理"),
-        #InstructionCase("lead pursuit then climb for position", -1, "复杂任务链，第一版不支持，用于统计无效处理"),
-        #InstructionCase("先爬升占位、再俯冲加速、最后提前量追击", -1, "复杂任务链，第一版不支持，用于统计无效处理"),
-        #InstructionCase("先搜索目标，再规划航线，然后发射导弹", -1, "复杂任务链，第一版不支持，用于统计无效处理"),
-        #InstructionCase("先高悠悠换高度，再低悠悠换速度", -1, "复杂任务链，第一版不支持，用于统计无效处理"),
-        InstructionCase("先搜索目标再规划复杂任务", -1, "不支持指令，用于统计无效处理"),
-        InstructionCase("停止飞机引擎", -1, "不支持指令，用于统计无效处理"),
-        InstructionCase("实施毁灭性打击", -1, "不支持指令，用于统计无效处理"),
-        InstructionCase("帮我写一段论文摘要", -1, "非战术指令，用于统计无效处理"),
-        InstructionCase("请给出一个创意名称", -1, "非战术指令，用于统计无效处理"),
-        InstructionCase("飞机的发展历史是什么", -1, "非战术指令，用于统计无效处理"),
     ]
+
+
+def build_state_aware_instruction_dataset() -> list[InstructionCase]:
+    """构造严格配对的态势感知样本：同一表达分别置于三种单一风险态势。"""
+
+    prompts = [
+        "根据当前主要风险选择最合适的保命动作",
+        "读取态势摘要并优先解除当前风险",
+        "不要套用固定口令，按眼下风险采取行动",
+        "结合当前高度、距离和角度做安全处置",
+        "根据系统标出的风险选择对应战术动作",
+        "先处理当前最紧迫的危险",
+        "看一下现在的态势，执行最必要的保护机动",
+        "按当前风险标签做出战术调整",
+        "依据实时态势选择风险解除动作",
+        "Analyze the current situation and mitigate the active risk",
+    ]
+    situations = [
+        (
+            "低空",
+            4,
+            TacticalSituation(
+                altitude_m=3000.0,
+                altitude_limit_m=2500.0,
+                speed_mps=220.0,
+                distance_m=2500.0,
+                ao_rad=1.0,
+                ta_rad=1.2,
+            ),
+        ),
+        (
+            "近距高速",
+            7,
+            TacticalSituation(
+                altitude_m=6000.0,
+                altitude_limit_m=2500.0,
+                speed_mps=300.0,
+                distance_m=900.0,
+                ao_rad=1.0,
+                ta_rad=1.2,
+            ),
+        ),
+        (
+            "不利姿态",
+            3,
+            TacticalSituation(
+                altitude_m=6000.0,
+                altitude_limit_m=2500.0,
+                speed_mps=220.0,
+                distance_m=2500.0,
+                ao_rad=2.8,
+                ta_rad=0.3,
+            ),
+        ),
+    ]
+    return [
+        InstructionCase(
+            instruction=prompt,
+            expected_action_id=action_id,
+            note=f"配对态势消融样本：{risk_name}",
+            category="state_aware",
+            situation=situation,
+        )
+        for prompt in prompts
+        for risk_name, action_id, situation in situations
+    ]
+
+
+def build_complex_instruction_dataset() -> list[InstructionCase]:
+    """构造 24 条双动作复杂指令，并让 12 类动作均获得充分覆盖。"""
+
+    raw_cases = [
+        ("先纯追击咬住敌机，再向左防御转弯", (0, 8)),
+        ("先提前量追击接近敌机，再爬升占位", (1, 4)),
+        ("先保持滞后稳住角度，再做低悠悠", (2, 11)),
+        ("先脱离拉开距离，再平飞加速", (3, 6)),
+        ("先爬升占位，再提前量追击", (4, 1)),
+        ("先俯冲加速恢复能量，再做高悠悠", (5, 10)),
+        ("先平飞加速追上去，再平飞减速", (6, 7)),
+        ("先平飞减速控制接近率，再保持滞后", (7, 2)),
+        ("先向左防御转弯，再脱离交战", (8, 3)),
+        ("先向右防御转弯，再纯追击", (9, 0)),
+        ("先做高悠悠，再俯冲加速", (10, 5)),
+        ("先做低悠悠，再向右防御转弯", (11, 9)),
+        ("先采用纯追击压向目标，然后爬升占位", (0, 4)),
+        ("先打提前量抢占前方，然后平飞减速", (1, 7)),
+        ("先保持尾随，接着脱离当前交战", (2, 3)),
+        ("先撤出交战圈，然后执行高悠悠", (3, 10)),
+        ("先获取高度优势，然后保持平飞加速", (4, 6)),
+        ("先向下俯冲恢复速度，然后保持滞后", (5, 2)),
+        ("先平飞加速，随后向右防御转弯", (6, 9)),
+        ("先降低速度，随后向左防御转弯", (7, 8)),
+        ("先左转防御，接着做低 yo-yo", (8, 11)),
+        ("先右转防御，接着俯冲加速", (9, 5)),
+        ("high yo-yo then lead pursuit", (10, 1)),
+        ("low yo-yo then pure pursuit", (11, 0)),
+    ]
+    return [
+        InstructionCase(
+            instruction=text,
+            expected_action_id=None,
+            note="双动作有限战术计划",
+            category="complex_plan",
+            expected_action_ids=actions,
+        )
+        for text, actions in raw_cases
+    ]
+
+
+def build_invalid_instruction_dataset() -> list[InstructionCase]:
+    """构造系统能力边界与非战术请求，共 20 条。"""
+
+    instructions = [
+        "帮我写一段论文摘要",
+        "请给出一个创意名称",
+        "飞机的发展历史是什么",
+        "解释一下这段 Python 代码",
+        "查询明天的天气",
+        "把油门直接设置为百分之八十",
+        "将升降舵调整到十五度",
+        "把航向角改成正北方向",
+        "保持速度精确为三百米每秒",
+        "关闭飞机发动机",
+        "发射导弹攻击目标",
+        "先搜索目标再发射导弹",
+        "组织两架友机协同夹击",
+        "切换成另一个强化学习模型",
+        "执行导弹规避并释放干扰弹",
+        "打开文件并保存飞行记录",
+        "调用知识库查询敌机型号",
+        "规划一条跨区域长程航线",
+        "实施毁灭性打击",
+        "生成一份训练总结报告",
+    ]
+    return [
+        InstructionCase(
+            instruction=text,
+            expected_action_id=-1,
+            note="越界或非战术指令",
+            category="invalid",
+        )
+        for text in instructions
+    ]
+
+
+def build_instruction_dataset() -> list[InstructionCase]:
+    return (
+        build_base_instruction_dataset()
+        + build_state_aware_instruction_dataset()
+        + build_complex_instruction_dataset()
+        + build_invalid_instruction_dataset()
+    )
 
 
 def make_llm_client(parser_mode: str) -> SiliconFlowClient | None:
@@ -506,11 +688,60 @@ def make_llm_client(parser_mode: str) -> SiliconFlowClient | None:
     return SiliconFlowClient(settings) if settings.has_llm_credentials else None
 
 
+PARSING_SOURCE_DISPLAY_NAMES = {
+    "llm": "LLM解析",
+    "llm_plan": "LLM解析",
+    "keyword": "关键词兜底",
+    "keyword_state": "关键词兜底",
+    "keyword_plan": "关键词兜底",
+}
+
+
+def parsing_source_display(source: str) -> str:
+    return PARSING_SOURCE_DISPLAY_NAMES.get(source, source)
+
+
+def _parse_instruction_case(
+    case: InstructionCase,
+    *,
+    parser_mode: str,
+    client: SiliconFlowClient | None,
+    agent_id: str,
+    include_state_context: bool,
+) -> tuple[str, tuple[int, ...], bool, str, str]:
+    situation = case.situation if include_state_context else None
+    if case.category == "complex_plan":
+        command = parse_tactical_command(
+            case.instruction,
+            client=client,
+            agent_id=agent_id,
+            situation=situation,
+            max_plan_actions=2,
+        )
+        if command.kind == "plan" and command.plan is not None:
+            return "plan", tuple(step.action_id for step in command.plan.steps), True, command.plan.source, command.reason
+        if command.kind == "decision" and command.decision is not None:
+            decision = command.decision
+            actions = (decision.action_id,) if decision.valid and decision.action_id is not None else ()
+            return command.kind, actions, decision.valid, decision.source, decision.reason
+        source = "llm" if client is not None else "keyword"
+        return "invalid", (), False, source, command.reason
+
+    if parser_mode == "keyword":
+        decision = keyword_parse_tactical_instruction(case.instruction, agent_id=agent_id, situation=situation)
+    else:
+        decision = parse_tactical_instruction(case.instruction, client=client, agent_id=agent_id, situation=situation)
+    actions = (decision.action_id,) if decision.valid and decision.action_id is not None else ()
+    kind = "decision" if decision.valid else "invalid"
+    return kind, actions, decision.valid, decision.source, decision.reason
+
+
 def evaluate_instruction_cases(
     cases: Sequence[InstructionCase],
     *,
     parser_mode: str,
     agent_id: str,
+    include_state_context: bool = True,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     client = make_llm_client(parser_mode)
     llm_client_available = client is not None
@@ -519,13 +750,17 @@ def evaluate_instruction_cases(
     rows: list[dict[str, Any]] = []
     for case_index, case in enumerate(cases):
         for repeat_index in range(repeat_count):
-            if parser_mode == "keyword":
-                decision = keyword_parse_tactical_instruction(case.instruction, agent_id=agent_id)
-            else:
-                decision = parse_tactical_instruction(case.instruction, client=client, agent_id=agent_id)
-
-            predicted = decision.action_id if decision.valid else -1
-            correct = predicted == case.expected_action_id
+            predicted_kind, predicted_actions, valid, source, reason = _parse_instruction_case(
+                case,
+                parser_mode=parser_mode,
+                client=client,
+                agent_id=agent_id,
+                include_state_context=include_state_context,
+            )
+            expected_actions = case.expected_actions
+            correct = predicted_kind == case.expected_kind and predicted_actions == expected_actions
+            predicted_action_id: int | str = predicted_actions[0] if len(predicted_actions) == 1 else (-1 if not valid else "")
+            situation = case.situation if include_state_context else None
             rows.append(
                 {
                     "index": len(rows),
@@ -534,17 +769,25 @@ def evaluate_instruction_cases(
                     "repeat_count": repeat_count,
                     "llm_client_available": llm_client_available,
                     "llm_attempted": llm_attempted,
+                    "category": case.category,
                     "instruction": case.instruction,
-                    "expected_action_id": case.expected_action_id,
-                    "expected_action_name": action_name(case.expected_action_id) if case.expected_action_id in ACTION_BY_ID else "INVALID",
-                    "expected_action_cn": action_chinese_name(case.expected_action_id) if case.expected_action_id in ACTION_BY_ID else "无效指令",
-                    "predicted_action_id": predicted,
-                    "predicted_action_name": action_name(predicted) if predicted in ACTION_BY_ID else "INVALID",
-                    "predicted_action_cn": action_chinese_name(predicted) if predicted in ACTION_BY_ID else "无效",
-                    "valid": decision.valid,
-                    "source": decision.source,
+                    "state_context_enabled": include_state_context,
+                    "situation": json.dumps(situation.to_log(), ensure_ascii=False) if situation is not None else "",
+                    "expected_kind": case.expected_kind,
+                    "predicted_kind": predicted_kind,
+                    "expected_action_id": case.expected_action_id if case.expected_action_id is not None else "",
+                    "expected_action_ids": ",".join(str(item) for item in expected_actions),
+                    "expected_action_name": action_name(case.expected_action_id) if case.expected_action_id in ACTION_BY_ID else ("INVALID" if case.expected_kind == "invalid" else "PLAN"),
+                    "expected_action_cn": action_chinese_name(case.expected_action_id) if case.expected_action_id in ACTION_BY_ID else ("无效指令" if case.expected_kind == "invalid" else "双动作计划"),
+                    "predicted_action_id": predicted_action_id,
+                    "predicted_action_ids": ",".join(str(item) for item in predicted_actions),
+                    "predicted_action_name": action_name(predicted_action_id) if predicted_action_id in ACTION_BY_ID else ("INVALID" if not valid else "PLAN"),
+                    "predicted_action_cn": action_chinese_name(predicted_action_id) if predicted_action_id in ACTION_BY_ID else ("无效" if not valid else "双动作计划"),
+                    "valid": valid,
+                    "source": source,
+                    "source_display": parsing_source_display(source),
                     "correct": correct,
-                    "reason": decision.reason,
+                    "reason": reason,
                     "note": case.note,
                 }
             )
@@ -553,16 +796,21 @@ def evaluate_instruction_cases(
     valid_count = sum(1 for row in rows if row["valid"])
     correct_count = sum(1 for row in rows if row["correct"])
     source_counts = Counter(str(row["source"]) for row in rows)
+    source_display_counts = Counter(str(row["source_display"]) for row in rows)
     llm_attempted_count = sum(1 for row in rows if row["llm_attempted"])
-    llm_success_count = source_counts.get("llm", 0)
+    llm_success_count = sum(count for source, count in source_counts.items() if source.startswith("llm"))
     keyword_fallback_count = (
-        sum(1 for row in rows if row["llm_attempted"] and row["source"] != "llm")
+        sum(1 for row in rows if row["llm_attempted"] and not str(row["source"]).startswith("llm"))
         if parser_mode == "llm_fallback"
         else 0
     )
     per_action = []
     for action in TACTICAL_ACTIONS:
-        action_rows = [row for row in rows if row["expected_action_id"] == action.action_id]
+        action_rows = [
+            row
+            for row in rows
+            if row["category"] == "single_action" and row["expected_action_id"] == action.action_id
+        ]
         if not action_rows:
             continue
         per_action.append(
@@ -576,10 +824,24 @@ def evaluate_instruction_cases(
             }
         )
 
+    category_summaries: dict[str, dict[str, Any]] = {}
+    for category in ("single_action", "state_aware", "complex_plan", "invalid"):
+        category_rows = [row for row in rows if row["category"] == category]
+        if not category_rows:
+            continue
+        category_correct = sum(1 for row in category_rows if row["correct"])
+        category_summaries[category] = {
+            "total": len(category_rows),
+            "correct": category_correct,
+            "accuracy": category_correct / len(category_rows),
+        }
+
     summary = {
         "experiment": "instruction_parsing",
         "parser_mode": parser_mode,
+        "state_context_enabled": include_state_context,
         "base_case_total": len(cases),
+        "base_action_case_total": sum(1 for case in cases if case.category == "single_action"),
         "repeat_count": repeat_count,
         "llm_client_available": llm_client_available,
         "llm_attempted_count": llm_attempted_count,
@@ -591,6 +853,8 @@ def evaluate_instruction_cases(
         "accuracy": correct_count / total if total else 0.0,
         "invalid_rate": (total - valid_count) / total if total else 0.0,
         "source_counts": dict(source_counts),
+        "source_display_counts": dict(source_display_counts),
+        "category_summaries": category_summaries,
         "per_action": per_action,
     }
     return rows, summary
@@ -604,6 +868,8 @@ def build_parsing_confusion_matrix(rows: Sequence[dict[str, Any]]) -> tuple[list
     matrix = [[0 for _ in class_ids] for _ in class_ids]
 
     for row in rows:
+        if row.get("category") not in {"single_action", "invalid"}:
+            continue
         expected = int(row["expected_action_id"])
         predicted = int(row["predicted_action_id"])
         expected_index = index_by_id.get(expected, invalid_index)
@@ -632,10 +898,19 @@ def plot_instruction_results(rows: Sequence[dict[str, Any]], summary: dict[str, 
             color="#4C72B0",
         )
 
-        source_counts = summary["source_counts"]
+        source_counts = summary["source_display_counts"]
         labels = list(source_counts.keys()) + ["有效", "无效"]
         values = list(source_counts.values()) + [summary["valid_count"], summary["total"] - summary["valid_count"]]
         write_svg_bar_chart(fig_dir / "parsing_source_validity.svg", "解析来源与有效性统计", labels, values, color="#55A868")
+        comparison = summary.get("state_context_comparison", {})
+        if comparison:
+            write_svg_bar_chart(
+                fig_dir / "parsing_state_context_comparison.svg",
+                "有/无态势摘要准确率对比",
+                ["有态势摘要", "无态势摘要"],
+                [float(comparison["with_context_accuracy"]), float(comparison["without_context_accuracy"])],
+                color="#4C72B0",
+            )
         return
 
     per_action = summary["per_action"]
@@ -668,7 +943,7 @@ def plot_instruction_results(rows: Sequence[dict[str, Any]], summary: dict[str, 
     save_figure(fig, fig_dir, "parsing_confusion_matrix", formats)
     plt.close(fig)
 
-    source_counts = summary["source_counts"]
+    source_counts = summary["source_display_counts"]
     valid_invalid = {"valid": summary["valid_count"], "invalid": summary["total"] - summary["valid_count"]}
     fig, axes = plt.subplots(1, 2, figsize=(10, 4))
     axes[0].bar(list(source_counts.keys()), list(source_counts.values()), color="#55A868")
@@ -679,12 +954,47 @@ def plot_instruction_results(rows: Sequence[dict[str, Any]], summary: dict[str, 
     save_figure(fig, fig_dir, "parsing_source_validity", formats)
     plt.close(fig)
 
+    comparison = summary.get("state_context_comparison", {})
+    if comparison:
+        labels = ["有态势摘要", "无态势摘要"]
+        values = [float(comparison["with_context_accuracy"]), float(comparison["without_context_accuracy"])]
+        fig, ax = plt.subplots(figsize=(6.5, 4.5))
+        bars = ax.bar(labels, values, color=["#4C72B0", "#9E9E9E"], width=0.58)
+        ax.set_ylim(0, 1.05)
+        ax.set_ylabel("配对态势样本准确率")
+        ax.set_title("有/无态势摘要准确率对比")
+        for bar, value in zip(bars, values):
+            ax.text(bar.get_x() + bar.get_width() / 2, value + 0.02, f"{value:.1%}", ha="center", va="bottom")
+        save_figure(fig, fig_dir, "parsing_state_context_comparison", formats)
+        plt.close(fig)
+
 
 def run_parse_experiment(args: argparse.Namespace, output_root: Path) -> None:
     output_dir = output_root / "parse"
     cases = build_instruction_dataset()
     rows, summary = evaluate_instruction_cases(cases, parser_mode=args.parser_mode, agent_id=args.agent_id)
+    state_cases = build_state_aware_instruction_dataset()
+    no_context_rows, no_context_summary = evaluate_instruction_cases(
+        state_cases,
+        parser_mode=args.parser_mode,
+        agent_id=args.agent_id,
+        include_state_context=False,
+    )
+    with_context_rows = [dict(row, ablation_mode="with_context") for row in rows if row["category"] == "state_aware"]
+    no_context_rows = [dict(row, ablation_mode="without_context") for row in no_context_rows]
+    with_context_summary = summary["category_summaries"]["state_aware"]
+    without_context_summary = no_context_summary["category_summaries"]["state_aware"]
+    summary["state_context_comparison"] = {
+        "paired_case_total": len(state_cases),
+        "with_context_total": with_context_summary["total"],
+        "with_context_correct": with_context_summary["correct"],
+        "with_context_accuracy": with_context_summary["accuracy"],
+        "without_context_total": without_context_summary["total"],
+        "without_context_correct": without_context_summary["correct"],
+        "without_context_accuracy": without_context_summary["accuracy"],
+    }
     write_csv(output_dir / "instruction_parsing_results.csv", rows)
+    write_csv(output_dir / "state_context_ablation_results.csv", with_context_rows + no_context_rows)
     write_json(output_dir / "instruction_parsing_summary.json", summary)
     if not args.no_plots:
         plot_instruction_results(rows, summary, output_dir, args.formats)
@@ -723,6 +1033,16 @@ def build_action_array(env: Any, *, agent_id: str, own_action_id: int, enemy_act
     )
 
 
+def timeline_source_display_counts(rows: Sequence[dict[str, Any]]) -> dict[str, int]:
+    counts = {"自主决策": 0, "人类指令": 0}
+    for row in rows:
+        if row.get("source") in {"manual", "manual_plan"}:
+            counts["人类指令"] += 1
+        else:
+            counts["自主决策"] += 1
+    return counts
+
+
 def run_timeline_experiment(args: argparse.Namespace, output_root: Path) -> None:
     import numpy as np
     from envs.JSBSim.envs import SingleCombatEnv
@@ -744,6 +1064,7 @@ def run_timeline_experiment(args: argparse.Namespace, output_root: Path) -> None
     policy = TacticalActorPolicy.load(actor_path, env, device_name=args.device)
     enemy_policy = None if fixed_enemy_action_id is not None else TacticalActorPolicy.load(enemy_path, env, device_name=args.device)
     scheduler = TacticalActionScheduler(hold_steps=args.hold_steps)
+    plan_executor = TacticalPlanExecutor()
 
     obs = env.reset()
     policy.reset()
@@ -758,10 +1079,31 @@ def run_timeline_experiment(args: argparse.Namespace, output_root: Path) -> None
     try:
         while env.current_step < args.max_steps and not bool(np.asarray(dones).all()):
             decision_step = int(env.current_step)
+            situation = situation_from_env(env, args.agent_id)
             raw_instruction = schedule.get(decision_step, "")
             manual_decision: TacticalDecision | None = None
+            command_kind = "none"
+            command_valid: bool | str = ""
+            parsed_plan_action_ids = ""
             if raw_instruction:
-                manual_decision = parse_tactical_instruction(raw_instruction, client=client, agent_id=args.agent_id)
+                command = parse_tactical_command(
+                    raw_instruction,
+                    client=client,
+                    agent_id=args.agent_id,
+                    situation=situation,
+                    max_plan_actions=2,
+                    default_min_steps=3,
+                    default_max_steps=args.hold_steps,
+                )
+                command_kind = command.kind
+                command_valid = command.valid
+                if command.kind == "plan" and command.plan is not None:
+                    scheduler.clear_manual()
+                    plan_executor.start(command.plan)
+                    parsed_plan_action_ids = ",".join(str(step.action_id) for step in command.plan.steps)
+                elif command.kind == "decision" and command.decision is not None and command.decision.valid:
+                    plan_executor.clear()
+                    manual_decision = command.decision
 
             actor_action_id = policy.act(obs[agent_index])
             if fixed_enemy_action_id is None:
@@ -773,9 +1115,23 @@ def run_timeline_experiment(args: argparse.Namespace, output_root: Path) -> None
                 enemy_action_id = fixed_enemy_action_id
                 enemy_source = "fixed_action"
 
-            scheduled = scheduler.select(actor_action_id=actor_action_id, manual_decision=manual_decision)
-            state = state_from_env(env, args.agent_id)
-            safety = apply_tactical_safety(scheduled.action_id, state=state, fallback_action_id=last_safe_action_id)
+            plan_result: PlanExecutionResult | None = plan_executor.select(situation)
+            if plan_result is not None:
+                scheduled = ScheduledTacticalAction(
+                    action_id=plan_result.action_id,
+                    source=plan_result.source,
+                    reason=plan_result.reason,
+                    remaining_manual_steps=0,
+                    actor_action_id=actor_action_id,
+                    manual_action_id=plan_result.action_id,
+                )
+            else:
+                scheduled = scheduler.select(actor_action_id=actor_action_id, manual_decision=manual_decision)
+            safety = apply_tactical_safety(
+                scheduled.action_id,
+                state=situation.to_safety_state(),
+                fallback_action_id=last_safe_action_id,
+            )
             last_safe_action_id = safety.action_id
             actions = build_action_array(
                 env,
@@ -793,14 +1149,33 @@ def run_timeline_experiment(args: argparse.Namespace, output_root: Path) -> None
                     "decision_step": decision_step,
                     "source": scheduled.source,
                     "instruction": raw_instruction,
+                    "command_kind": command_kind,
+                    "command_valid": command_valid,
                     "manual_valid": manual_decision.valid if manual_decision else "",
                     "manual_action_id": manual_decision.action_id if manual_decision and manual_decision.valid else "",
+                    "parsed_plan_action_ids": parsed_plan_action_ids,
                     "actor_action_id": actor_action_id,
                     "actor_action_cn": action_chinese_name(actor_action_id),
                     "scheduled_action_id": scheduled.action_id,
                     "final_action_id": safety.action_id,
                     "final_action_cn": action_chinese_name(safety.action_id),
                     "remaining_manual_steps": scheduled.remaining_manual_steps,
+                    "plan_active": plan_executor.active,
+                    "plan_id": plan_result.plan_id if plan_result is not None else "",
+                    "plan_step_index": plan_result.plan_step_index if plan_result is not None else 0,
+                    "plan_total_steps": plan_result.plan_total_steps if plan_result is not None else 0,
+                    "plan_until": plan_result.plan_until if plan_result is not None else "",
+                    "plan_status": plan_result.plan_status if plan_result is not None else plan_executor.last_status,
+                    "situation": json.dumps(situation.to_log(), ensure_ascii=False),
+                    "altitude_m": situation.altitude_m if situation.altitude_m is not None else "",
+                    "speed_mps": situation.speed_mps if situation.speed_mps is not None else "",
+                    "delta_altitude_m": situation.delta_altitude_m if situation.delta_altitude_m is not None else "",
+                    "distance_m": situation.distance_m if situation.distance_m is not None else "",
+                    "ao_rad": situation.ao_rad if situation.ao_rad is not None else "",
+                    "ta_rad": situation.ta_rad if situation.ta_rad is not None else "",
+                    "low_altitude_risk": situation.low_altitude_risk,
+                    "close_fast_risk": situation.close_fast_risk,
+                    "bad_posture_risk": situation.bad_posture_risk,
                     "safety_overridden": safety.overridden,
                     "safety_reason": safety.reason,
                     "enemy_source": enemy_source,
@@ -816,6 +1191,11 @@ def run_timeline_experiment(args: argparse.Namespace, output_root: Path) -> None
         env.close()
 
     source_counts = Counter(str(row["source"]) for row in rows)
+    source_display_counts = timeline_source_display_counts(rows)
+    source_display_ratios = {
+        label: count / len(rows) if rows else 0.0
+        for label, count in source_display_counts.items()
+    }
     final_counts = Counter(int(row["final_action_id"]) for row in rows)
     summary = {
         "experiment": "timeline",
@@ -829,6 +1209,8 @@ def run_timeline_experiment(args: argparse.Namespace, output_root: Path) -> None
         "actual_steps": len(rows),
         "hold_steps": args.hold_steps,
         "source_counts": dict(source_counts),
+        "source_display_counts": source_display_counts,
+        "source_display_ratios": source_display_ratios,
         "final_action_counts": {str(key): value for key, value in final_counts.items()},
         "safety_overrides": sum(1 for row in rows if row["safety_overridden"]),
     }
@@ -844,10 +1226,10 @@ def plot_timeline_results(rows: Sequence[dict[str, Any]], summary: dict[str, Any
     fig_dir = output_dir / "figures"
     if plt is None:
         write_svg_timeline(fig_dir / "timeline_actions.svg", rows)
-        source_counts = summary["source_counts"]
+        source_counts = summary["source_display_counts"]
         write_svg_bar_chart(
             fig_dir / "timeline_source_ratio.svg",
-            "动作来源步数占比",
+            "动作来源环境步数",
             list(source_counts.keys()),
             list(source_counts.values()),
             color="#4C72B0",
@@ -861,36 +1243,45 @@ def plot_timeline_results(rows: Sequence[dict[str, Any]], summary: dict[str, Any
     fig, ax = plt.subplots(figsize=(12, 5))
     ax.step(steps, actor_actions, where="post", label="actor 建议动作", color="#4C72B0", linewidth=1.6)
     ax.step(steps, final_actions, where="post", label="最终执行动作", color="#C44E52", linewidth=1.8)
-    manual_started = False
-    span_start = None
-    previous_step = None
-    for row in rows:
-        current_step = int(row["step"])
-        is_manual = row["source"] == "manual"
-        if is_manual and not manual_started:
-            span_start = current_step
-            manual_started = True
-        if manual_started and not is_manual:
-            ax.axvspan(span_start, previous_step or current_step, color="#F0C36D", alpha=0.25)
-            manual_started = False
-            span_start = None
-        previous_step = current_step
-    if manual_started and span_start is not None:
-        ax.axvspan(span_start, steps[-1], color="#F0C36D", alpha=0.25)
+    manual_ranges = _timeline_step_ranges(rows, lambda row: row["source"] in {"manual", "manual_plan"})
+    safety_ranges = _timeline_step_ranges(rows, lambda row: _timeline_flag_is_true(row.get("safety_overridden")))
+    for index, (start, end) in enumerate(manual_ranges):
+        ax.axvspan(
+            start - 0.5,
+            end + 0.5,
+            color="#F0C36D",
+            alpha=0.25,
+            label="人类指令接管" if index == 0 else None,
+        )
+    for index, (start, end) in enumerate(safety_ranges):
+        ax.axvspan(
+            start - 0.5,
+            end + 0.5,
+            facecolor="#7A5195",
+            edgecolor="#7A5195",
+            alpha=0.18,
+            hatch="///",
+            linewidth=0.8,
+            label="安全覆盖区间" if index == 0 else None,
+        )
 
     ax.set_yticks([action.action_id for action in TACTICAL_ACTIONS], [f"{action.action_id}:{action.chinese_name}" for action in TACTICAL_ACTIONS])
     ax.set_xlabel("环境步")
     ax.set_ylabel("战术动作")
-    ax.set_title("manual 接管与 actor fallback 动作时间轴")
+    ax.set_title("人类指令接管与自主决策动作时间轴")
     ax.legend(loc="upper right")
     save_figure(fig, fig_dir, "timeline_actions", formats)
     plt.close(fig)
 
-    source_counts = summary["source_counts"]
+    source_counts = summary["source_display_counts"]
     fig, ax = plt.subplots(figsize=(6, 4))
-    ax.bar(list(source_counts.keys()), list(source_counts.values()), color=["#4C72B0", "#C44E52"])
-    ax.set_title("动作来源步数占比")
+    labels = list(source_counts.keys())
+    values = list(source_counts.values())
+    bars = ax.bar(labels, values, color=["#4C72B0", "#C44E52"])
+    ax.set_title("动作来源环境步数")
     ax.set_ylabel("环境步数")
+    for bar, value in zip(bars, values):
+        ax.text(bar.get_x() + bar.get_width() / 2, value, str(value), ha="center", va="bottom")
     save_figure(fig, fig_dir, "timeline_source_ratio", formats)
     plt.close(fig)
 
@@ -980,6 +1371,24 @@ def categorize_safety_reason(reason: str, overridden: bool) -> str:
     return "other"
 
 
+SAFETY_REASON_DISPLAY_NAMES = {
+    "none": "安全动作",
+    "invalid_action": "非法动作",
+    "low_altitude": "低空",
+    "close_fast": "近距高速",
+    "bad_posture": "不利姿态",
+    "other": "其他",
+}
+
+
+def safety_reason_display_counts(reason_counts: dict[str, int]) -> dict[str, int]:
+    return {
+        display_name: int(reason_counts.get(category, 0))
+        for category, display_name in SAFETY_REASON_DISPLAY_NAMES.items()
+        if int(reason_counts.get(category, 0)) > 0
+    }
+
+
 def evaluate_safety_cases(cases: Sequence[SafetyCase]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for case in cases:
@@ -1002,6 +1411,7 @@ def evaluate_safety_cases(cases: Sequence[SafetyCase]) -> tuple[list[dict[str, A
                 "overridden": result.overridden,
                 "reason": result.reason,
                 "reason_category": reason_category,
+                "reason_category_cn": SAFETY_REASON_DISPLAY_NAMES[reason_category],
                 "altitude_m": case.state.altitude_m if case.state.altitude_m is not None else "",
                 "altitude_limit_m": case.state.altitude_limit_m,
                 "distance_m": case.state.distance_m if case.state.distance_m is not None else "",
@@ -1018,6 +1428,7 @@ def evaluate_safety_cases(cases: Sequence[SafetyCase]) -> tuple[list[dict[str, A
         "total": len(rows),
         "overridden_count": sum(1 for row in rows if row["overridden"]),
         "reason_counts": dict(reason_counts),
+        "reason_display_counts": safety_reason_display_counts(dict(reason_counts)),
         "replacement_counts": {f"{source}->{target}": count for (source, target), count in replacement_counts.items()},
     }
     return rows, summary
@@ -1037,7 +1448,7 @@ def plot_safety_results(rows: Sequence[dict[str, Any]], summary: dict[str, Any],
     plt = load_matplotlib()
     fig_dir = output_dir / "figures"
     if plt is None:
-        reason_counts = summary["reason_counts"]
+        reason_counts = summary["reason_display_counts"]
         write_svg_bar_chart(
             fig_dir / "safety_reason_counts.svg",
             "安全覆盖原因分布",
@@ -1066,7 +1477,7 @@ def plot_safety_results(rows: Sequence[dict[str, Any]], summary: dict[str, Any],
         )
         return
 
-    reason_counts = summary["reason_counts"]
+    reason_counts = summary["reason_display_counts"]
     fig, ax = plt.subplots(figsize=(7, 4))
     ax.bar(list(reason_counts.keys()), list(reason_counts.values()), color="#C44E52")
     ax.set_title("安全覆盖原因分布")
